@@ -26,7 +26,7 @@ The GNU Radio flowgraph can stay focused on RF/demodulation while the clip write
   Reads mono 16-bit PCM audio from stdin, opens a WAV file when RMS rises above the squelch threshold, waits for hang time after audio drops, and moves completed clips into `runtime/queue`.
 
 - `scripts/transcribe_worker.py`  
-  Watches `runtime/queue`, moves completed WAV files into `runtime/processing`, runs `faster-whisper`, optionally cleans up the rough text through an OpenAI-compatible local model server such as LM Studio, writes transcript JSON, and appends to `runtime/transcripts/index.jsonl`.
+  Watches `runtime/queue`, moves completed WAV files into `runtime/processing`, runs `faster-whisper`, optionally cleans up the rough text through an OpenAI-compatible model server such as LM Studio, writes transcript JSON, and appends to `runtime/transcripts/index.jsonl`.
 
 - `scripts/build_transcript_page.py`  
   Builds a simple auto-refreshing static web page at `runtime/transcripts/index.html`.
@@ -84,24 +84,36 @@ rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 -p 135 - | \
     --hang-ms 1200
 ```
 
-Terminal 2: transcribe completed clips:
+Terminal 2: transcribe completed clips without LM Studio cleanup:
 
 ```bash
 source .venv/bin/activate
 python3 scripts/transcribe_worker.py \
   --whisper-model small.en \
   --device cpu \
-  --compute-type int8
+  --compute-type int8 \
+  --no-cleanup
 ```
 
-If LM Studio is not running yet, skip the cleanup pass:
+Terminal 2 alternative: transcribe with LM Studio cleanup on a remote box:
+
+```bash
+source .venv/bin/activate
+python3 scripts/transcribe_worker.py \
+  --whisper-model small.en \
+  --device cpu \
+  --compute-type int8 \
+  --lmstudio-host 192.168.3.28
+```
+
+You can also pass the full OpenAI-compatible URL:
 
 ```bash
 python3 scripts/transcribe_worker.py \
   --whisper-model small.en \
   --device cpu \
   --compute-type int8 \
-  --no-cleanup
+  --lmstudio-url http://192.168.3.28:1234/v1
 ```
 
 Terminal 3: serve the transcript web page:
@@ -127,18 +139,34 @@ Default cleanup model:
 bingbangboom/Qwen3508B-transcriber-15k-03
 ```
 
-Default local OpenAI-compatible endpoint:
+Default endpoint if no host or URL is provided:
 
 ```text
 http://127.0.0.1:1234/v1
 ```
 
-Override either value:
+For LM Studio running on another machine, pass just the host/IP:
 
 ```bash
-python3 scripts/transcribe_worker.py \
-  --cleanup-model bingbangboom/Qwen3508B-transcriber-15k-03 \
-  --lmstudio-url http://127.0.0.1:1234/v1
+python3 scripts/transcribe_worker.py --lmstudio-host 192.168.3.28
+```
+
+If LM Studio is on a non-default port:
+
+```bash
+python3 scripts/transcribe_worker.py --lmstudio-host 192.168.3.28 --lmstudio-port 1234
+```
+
+Or pass the full OpenAI-compatible base URL:
+
+```bash
+python3 scripts/transcribe_worker.py --lmstudio-url http://192.168.3.28:1234/v1
+```
+
+If LM Studio is not running yet, disable cleanup:
+
+```bash
+python3 scripts/transcribe_worker.py --no-cleanup
 ```
 
 ## Runtime folders
