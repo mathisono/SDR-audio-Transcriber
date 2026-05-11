@@ -25,9 +25,39 @@
     "show_frontend_controls": true
   },
   "audio": {
+    "sample_rate": 48000,
     "clip_directory": "runtime/queue",
+    "tmp_directory": "runtime/tmp",
     "min_clip_seconds": 1.0,
-    "hang_time_ms": 1200
+    "max_clip_seconds": 60.0,
+    "hang_time_ms": 1200,
+    "squelch_threshold_rms": 650
+  },
+  "clip_writer": {
+    "enabled": true,
+    "queue_directory": "runtime/queue",
+    "tmp_directory": "runtime/tmp",
+    "sample_rate": 48000,
+    "squelch_threshold_rms": 650,
+    "hang_time_ms": 1200,
+    "min_clip_seconds": 1.0,
+    "max_clip_seconds": 60.0
+  },
+  "transcription": {
+    "enabled": true,
+    "engine": "faster-whisper",
+    "whisper_model": "small.en",
+    "device": "cpu",
+    "compute_type": "int8",
+    "queue_directory": "runtime/queue",
+    "processing_directory": "runtime/processing",
+    "done_directory": "runtime/done",
+    "failed_directory": "runtime/failed",
+    "output_directory": "runtime/transcripts",
+    "cleanup_enabled": true,
+    "cleanup_provider": "lmstudio",
+    "cleanup_base_url": "http://127.0.0.1:1234/v1",
+    "cleanup_model": "bingbangboom/Qwen3508B-transcriber-15k-03"
   },
   "receivers": [
     {
@@ -40,7 +70,7 @@
       "bandwidth_hz": 180000,
       "squelch": -50,
       "audio_monitor": true,
-      "transcription_enabled": false
+      "transcription_enabled": true
     }
   ]
 }
