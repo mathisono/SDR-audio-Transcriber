@@ -110,7 +110,7 @@ class shared_baseband_one_channel(gr.top_block, Qt.QWidget):
             self.top_grid_layout.setRowStretch(r, 1)
         for c in range(2, 4):
             self.top_grid_layout.setColumnStretch(c, 1)
-        self._ppm_range = Range(100, 150, 1, 135, 200)
+        self._ppm_range = Range(-100, 150, 1, 135, 200)
         self._ppm_win = RangeWidget(self._ppm_range, self.set_ppm, 'PPM Correction', "counter_slider", int)
         self.top_grid_layout.addWidget(self._ppm_win, 0, 4, 1, 2)
         for r in range(0, 1):
@@ -133,7 +133,7 @@ class shared_baseband_one_channel(gr.top_block, Qt.QWidget):
             1 #number of inputs
         )
         self.qtgui_waterfall_sink_x_0.set_update_time(0.10)
-        self.qtgui_waterfall_sink_x_0.enable_grid(False)
+        self.qtgui_waterfall_sink_x_0.enable_grid(True)
         self.qtgui_waterfall_sink_x_0.enable_axis_labels(True)
 
 
@@ -319,11 +319,11 @@ class shared_baseband_one_channel(gr.top_block, Qt.QWidget):
 
     def set_samp_rate(self, samp_rate):
         self.samp_rate = samp_rate
+        self.freq_xlating_fir_filter_xxx_0.set_taps(firdes.low_pass(1.0, self.samp_rate, self.chan1_cutoff, self.chan1_transition))
         self.osmosdr_source_0.set_sample_rate(self.samp_rate)
         self.qtgui_freq_sink_x_0.set_frequency_range(0, self.samp_rate)
-        self.qtgui_waterfall_sink_x_0.set_frequency_range(0, self.samp_rate)
-        self.freq_xlating_fir_filter_xxx_0.set_taps(firdes.low_pass(1.0, self.samp_rate, self.chan1_cutoff, self.chan1_transition))
         self.qtgui_freq_sink_x_1.set_frequency_range(0, self.samp_rate/self.chan1_decim)
+        self.qtgui_waterfall_sink_x_0.set_frequency_range(0, self.samp_rate)
 
     def get_rf_gain(self):
         return self.rf_gain
