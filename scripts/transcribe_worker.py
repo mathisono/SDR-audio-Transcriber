@@ -3,7 +3,7 @@
 
 The worker treats runtime/queue/*.wav as complete input files. It moves each file
 into runtime/processing, runs faster-whisper for speech-to-text, optionally asks
-an OpenAI-compatible local model server such as LM Studio to clean up the rough
+an OpenAI-compatible model server such as LM Studio to clean up the rough
 transcript, writes JSON/JSONL outputs, rebuilds the simple HTML page, then moves
 finished audio into runtime/done.
 """
@@ -24,6 +24,34 @@ from faster_whisper import WhisperModel
 
 def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def normalize_lmstudio_url(host: str | None, port: int, url: str | None) -> str:
+    """Return an OpenAI-compatible /v1 base URL for LM Studio.
+
+    Users can provide either:
+      --lmstudio-host 192.168.3.28
+      --lmstudio-host 192.168.3.28:1234
+      --lmstudio-url http://192.168.3.28:1234/v1
+
+    A full URL wins over host/port. If a host includes http://, it is treated as
+    a URL-like host and normalized to include /v1 when missing.
+    """
+    if url:
+        base = url.strip().rstrip("/")
+    else:
+        value = (host or "127.0.0.1").strip().rstrip("/")
+        if value.startswith("http://") or value.startswith("https://"):
+            base = value
+        else:
+            if ":" in value:
+                base = f"http://{value}"
+            else:
+                base = f"http://{value}:{port}"
+
+    if not base.endswith("/v1"):
+        base = f"{base}/v1"
+    return base
 
 
 def load_sidecar(wav_path: Path) -> dict[str, Any]:
@@ -125,7 +153,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--whisper-model", default="small.en")
     parser.add_argument("--device", default="cpu", help="cpu or cuda")
     parser.add_argument("--compute-type", default="int8", help="int8 for CPU, float16 for CUDA")
-    parser.add_argument("--lmstudio-url", default="http://127.0.0.1:1234/v1")
+    parser.add_argument("--lmstudio-host", default="127.0.0.1", help="LM Studio host/IP, for example 192.168.3.28")
+    parser.add_argument("--lmstudio-port", type=int, default=1234, help="LM Studio server port")
+    parser.add_argument("--lmstudio-url", default=None, help="Full OpenAI-compatible base URL, for example http://192.168.3.28:1234/v1")
     parser.add_argument("--cleanup-model", default="bingbangboom/Qwen3508B-transcriber-15k-03")
     parser.add_argument("--cleanup-timeout", type=int, default=120)
     parser.add_argument("--no-cleanup", action="store_true", help="Skip local LLM cleanup step")
@@ -141,6 +171,7 @@ def main() -> int:
     done = Path(args.done)
     failed = Path(args.failed)
     transcripts = Path(args.transcripts)
+    lmstudio_url = normalize_lmstudio_url(args.lmstudio_host, args.lmstudio_port, args.lmstudio_url)
 
     for directory in [queue, processing, done, failed, transcripts]:
         directory.mkdir(parents=True, exist_ok=True)
@@ -156,6 +187,10 @@ def main() -> int:
 
     rebuild_page(transcripts)
     print("worker: watching queue", flush=True)
+    if args.no_cleanup:
+        print("worker: cleanup disabled", flush=True)
+    else:
+        print(f"worker: cleanup endpoint {lmstudio_url} model={args.cleanup_model}", flush=True)
 
     while True:
         wavs = sorted(queue.glob("*.wav"))
@@ -182,7 +217,7 @@ def main() -> int:
                 try:
                     clean_text = call_cleanup_model(
                         raw_text,
-                        args.lmstudio_url,
+                        lmstudio_url,
                         args.cleanup_model,
                         args.cleanup_timeout,
                     )
@@ -202,6 +237,7 @@ def main() -> int:
                 "text": clean_text,
                 "segments": segments,
                 "cleanup_model": None if args.no_cleanup else args.cleanup_model,
+                "cleanup_endpoint": None if args.no_cleanup else lmstudio_url,
                 "cleanup_error": cleanup_error,
             }
 
