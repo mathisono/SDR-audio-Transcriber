@@ -78,9 +78,16 @@ Start a first WBFM recorder test:
   rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 -p 135 - | \\
     python3 scripts/clip_writer.py --source MSE-88 --frequency 90700000 --receiver receiver1
 
-Start the transcription worker in another terminal:
+Start the transcription worker without LM Studio cleanup:
   source .venv/bin/activate
-  python3 scripts/transcribe_worker.py --whisper-model small.en --device cpu --compute-type int8
+  python3 scripts/transcribe_worker.py --whisper-model small.en --device cpu --compute-type int8 --no-cleanup
+
+Start the transcription worker with LM Studio cleanup on another box:
+  source .venv/bin/activate
+  python3 scripts/transcribe_worker.py --whisper-model small.en --device cpu --compute-type int8 --lmstudio-host 192.168.3.28
+
+You can also pass a full OpenAI-compatible URL:
+  python3 scripts/transcribe_worker.py --lmstudio-url http://192.168.3.28:1234/v1
 
 Serve the web page in another terminal:
   cd runtime/transcripts
@@ -88,6 +95,4 @@ Serve the web page in another terminal:
 
 Then open:
   http://localhost:8090/
-
-If LM Studio cleanup is not running, add --no-cleanup to transcribe_worker.py.
 EOF
