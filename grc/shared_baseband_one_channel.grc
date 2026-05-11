@@ -1,0 +1,449 @@
+options:
+  parameters:
+    author: KJ6DZB
+    category: Custom
+    cmake_opt: ''
+    comment: First working shared-baseband one-channel test flowgraph
+    copyright: ''
+    description: RTL-SDR shared baseband with one WBFM demod branch
+    gen_cmake: 'On'
+    gen_linking: dynamic
+    generate_options: qt_gui
+    hier_block_src_path: '.:'
+    id: shared_baseband_one_channel
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: Shared Baseband One Channel
+    window_size: 1600, 1000
+  states:
+    coordinate: [8, 11]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: samp_rate
+  id: variable
+  parameters:
+    comment: ''
+    value: '240000'
+  states:
+    coordinate: [160, 20]
+    rotation: 0
+    state: enabled
+- name: audio_rate
+  id: variable
+  parameters:
+    comment: ''
+    value: '48000'
+  states:
+    coordinate: [160, 80]
+    rotation: 0
+    state: enabled
+- name: gain_mode0
+  id: variable
+  parameters:
+    comment: ''
+    value: 'False'
+  states:
+    coordinate: [160, 140]
+    rotation: 0
+    state: enabled
+- name: chan1_decim
+  id: variable
+  parameters:
+    comment: ''
+    value: '5'
+  states:
+    coordinate: [160, 380]
+    rotation: 0
+    state: enabled
+- name: chan1_cutoff
+  id: variable
+  parameters:
+    comment: ''
+    value: '75000'
+  states:
+    coordinate: [160, 440]
+    rotation: 0
+    state: enabled
+- name: chan1_transition
+  id: variable
+  parameters:
+    comment: ''
+    value: '10000'
+  states:
+    coordinate: [160, 500]
+    rotation: 0
+    state: enabled
+- name: ppm
+  id: variable_qtgui_range
+  parameters:
+    comment: ''
+    gui_hint: 0,4,1,2
+    label: PPM Correction
+    min_len: '200'
+    orient: Qt.Horizontal
+    rangeType: int
+    start: '100'
+    step: '1'
+    stop: '150'
+    value: '135'
+    widget: counter_slider
+  states:
+    coordinate: [8, 640]
+    rotation: 0
+    state: enabled
+- name: rf_gain
+  id: variable_qtgui_range
+  parameters:
+    comment: ''
+    gui_hint: 1,4,1,2
+    label: RF Gain (dB)
+    min_len: '200'
+    orient: Qt.Horizontal
+    rangeType: float
+    start: '0'
+    step: '1'
+    stop: '50'
+    value: '25'
+    widget: counter_slider
+  states:
+    coordinate: [8, 720]
+    rotation: 0
+    state: enabled
+- name: chan1_offset
+  id: variable_qtgui_range
+  parameters:
+    comment: ''
+    gui_hint: 2,4,1,2
+    label: Receiver Offset (+/-50 kHz)
+    min_len: '200'
+    orient: Qt.Horizontal
+    rangeType: int
+    start: '-50000'
+    step: '1000'
+    stop: '50000'
+    value: '0'
+    widget: counter_slider
+  states:
+    coordinate: [8, 800]
+    rotation: 0
+    state: enabled
+- name: rf_center_freq
+  id: variable_qtgui_entry
+  parameters:
+    comment: ''
+    gui_hint: 0,2,1,2
+    label: RF Center Frequency (Hz)
+    type: real
+    value: '90700000'
+  states:
+    coordinate: [8, 880]
+    rotation: 0
+    state: enabled
+- name: gain_mode0_control
+  id: variable_qtgui_chooser
+  parameters:
+    gui_hint: 1,2,1,2
+    label: RF Gain Mode
+    label0: Manual
+    label1: Automatic
+    num_opts: '2'
+    option1: 'True'
+    options: '[False, True]'
+    orient: Qt.QHBoxLayout
+    type: raw
+    value: gain_mode0
+    widget: combo_box
+  states:
+    coordinate: [8, 960]
+    rotation: 0
+    state: enabled
+- name: osmosdr_source_0
+  id: osmosdr_source
+  parameters:
+    affinity: ''
+    alias: ''
+    ant0: ''
+    args: '"numchan=1 rtl=0"'
+    bb_gain0: '20'
+    bw0: '0'
+    clock_source0: ''
+    clock_source1: ''
+    clock_source2: ''
+    clock_source3: ''
+    clock_source4: ''
+    clock_source5: ''
+    clock_source6: ''
+    clock_source7: ''
+    comment: ''
+    corr0: ppm
+    dc_offset_mode0: '0'
+    freq0: rf_center_freq
+    gain0: rf_gain
+    gain_mode0: gain_mode0
+    if_gain0: '20'
+    iq_balance_mode0: '0'
+    nchan: '1'
+    num_mboards: '1'
+    sample_rate: samp_rate
+    sync: none
+    time_source0: ''
+    time_source1: ''
+    time_source2: ''
+    time_source3: ''
+    time_source4: ''
+    time_source5: ''
+    time_source6: ''
+    time_source7: ''
+    type: fc32
+  states:
+    coordinate: [392, 204]
+    rotation: 0
+    state: enabled
+- name: qtgui_freq_sink_x_0
+  id: qtgui_freq_sink_x
+  parameters:
+    affinity: ''
+    alias: ''
+    alpha1: '1.0'
+    alpha10: '1.0'
+    alpha2: '1.0'
+    alpha3: '1.0'
+    alpha4: '1.0'
+    alpha5: '1.0'
+    alpha6: '1.0'
+    alpha7: '1.0'
+    alpha8: '1.0'
+    alpha9: '1.0'
+    autoscale: 'False'
+    average: '1.0'
+    axislabels: 'True'
+    bw: samp_rate
+    color1: '"blue"'
+    color10: '"dark blue"'
+    color2: '"red"'
+    color3: '"green"'
+    color4: '"black"'
+    color5: '"cyan"'
+    color6: '"magenta"'
+    color7: '"yellow"'
+    color8: '"dark red"'
+    color9: '"dark green"'
+    comment: ''
+    ctrlpanel: 'False'
+    fc: '0'
+    fftsize: '1024'
+    freqhalf: 'False'
+    grid: 'False'
+    gui_hint: 0,0,1,2
+    label: Shared Baseband FFT (relative)
+    label1: ''
+    label10: ''
+    label2: ''
+    label3: ''
+    label4: ''
+    label5: ''
+    label6: ''
+    label7: ''
+    label8: ''
+    label9: ''
+    legend: 'False'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    name: '""'
+    nconnections: '1'
+    showports: 'True'
+    tr_chan: '0'
+    tr_level: '0.0'
+    tr_mode: qtgui.TRIG_MODE_FREE
+    tr_tag: '""'
+    type: complex
+    units: dB
+    update_time: '0.10'
+    wintype: firdes.WIN_BLACKMAN_hARRIS
+    ymax: '10'
+    ymin: '-140'
+  states:
+    coordinate: [728, 31]
+    rotation: 0
+    state: enabled
+- name: qtgui_waterfall_sink_x_0
+  id: qtgui_waterfall_sink_x
+  parameters:
+    affinity: ''
+    alias: ''
+    alpha1: '1.0'
+    alpha10: '1.0'
+    alpha2: '1.0'
+    alpha3: '1.0'
+    alpha4: '1.0'
+    alpha5: '1.0'
+    alpha6: '1.0'
+    alpha7: '1.0'
+    alpha8: '1.0'
+    alpha9: '1.0'
+    axislabels: 'True'
+    bw: samp_rate
+    color1: '0'
+    color10: '0'
+    color2: '0'
+    color3: '0'
+    color4: '0'
+    color5: '0'
+    color6: '0'
+    color7: '0'
+    color8: '0'
+    color9: '0'
+    comment: ''
+    fc: '0'
+    fftsize: '1024'
+    freqhalf: 'False'
+    grid: 'False'
+    gui_hint: 1,0,1,2
+    int_max: '10'
+    int_min: '-140'
+    label1: ''
+    label10: ''
+    label2: ''
+    label3: ''
+    label4: ''
+    label5: ''
+    label6: ''
+    label7: ''
+    label8: ''
+    label9: ''
+    legend: 'True'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    name: 'Shared Baseband Waterfall (relative)'
+    nconnections: '1'
+    showports: 'False'
+    type: complex
+    update_time: '0.10'
+    wintype: firdes.WIN_BLACKMAN_hARRIS
+  states:
+    coordinate: [728, 300]
+    rotation: 0
+    state: enabled
+- name: freq_xlating_fir_filter_xxx_0
+  id: freq_xlating_fir_filter_xxx
+  parameters:
+    center_freq: chan1_offset
+    comment: ''
+    decim: chan1_decim
+    samp_rate: samp_rate
+    taps: firdes.low_pass(1.0, samp_rate, chan1_cutoff, chan1_transition)
+    type: ccf
+  states:
+    coordinate: [728, 620]
+    rotation: 0
+    state: enabled
+- name: qtgui_freq_sink_x_1
+  id: qtgui_freq_sink_x
+  parameters:
+    affinity: ''
+    alias: ''
+    alpha1: '1.0'
+    alpha10: '1.0'
+    alpha2: '1.0'
+    alpha3: '1.0'
+    alpha4: '1.0'
+    alpha5: '1.0'
+    alpha6: '1.0'
+    alpha7: '1.0'
+    alpha8: '1.0'
+    alpha9: '1.0'
+    autoscale: 'False'
+    average: '1.0'
+    axislabels: 'True'
+    bw: samp_rate/chan1_decim
+    color1: '"blue"'
+    color10: '"dark blue"'
+    color2: '"red"'
+    color3: '"green"'
+    color4: '"black"'
+    color5: '"cyan"'
+    color6: '"magenta"'
+    color7: '"yellow"'
+    color8: '"dark red"'
+    color9: '"dark green"'
+    comment: ''
+    ctrlpanel: 'False'
+    fc: '0'
+    fftsize: '1024'
+    freqhalf: 'False'
+    grid: 'False'
+    gui_hint: 2,0,1,2
+    label: Receiver 1 Branch FFT
+    label1: ''
+    label10: ''
+    label2: ''
+    label3: ''
+    label4: ''
+    label5: ''
+    label6: ''
+    label7: ''
+    label8: ''
+    label9: ''
+    legend: 'False'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    name: '""'
+    nconnections: '1'
+    showports: 'True'
+    tr_chan: '0'
+    tr_level: '0.0'
+    tr_mode: qtgui.TRIG_MODE_FREE
+    tr_tag: '""'
+    type: complex
+    units: dB
+    update_time: '0.10'
+    wintype: firdes.WIN_BLACKMAN_hARRIS
+    ymax: '10'
+    ymin: '-140'
+  states:
+    coordinate: [1016, 500]
+    rotation: 0
+    state: enabled
+- name: analog_wfm_rcv_0
+  id: analog_wfm_rcv
+  parameters:
+    audio_decimation: '1'
+    comment: ''
+    quad_rate: samp_rate/chan1_decim
+  states:
+    coordinate: [1016, 620]
+    rotation: 0
+    state: enabled
+- name: audio_sink_0
+  id: audio_sink
+  parameters:
+    comment: ''
+    device_name: '""'
+    num_inputs: '1'
+    ok_to_block: 'True'
+    samp_rate: audio_rate
+  states:
+    coordinate: [1240, 620]
+    rotation: 0
+    state: enabled
+
+connections:
+- [osmosdr_source_0, '0', qtgui_freq_sink_x_0, '0']
+- [osmosdr_source_0, '0', qtgui_waterfall_sink_x_0, '0']
+- [osmosdr_source_0, '0', freq_xlating_fir_filter_xxx_0, '0']
+- [freq_xlating_fir_filter_xxx_0, '0', qtgui_freq_sink_x_1, '0']
+- [freq_xlating_fir_filter_xxx_0, '0', analog_wfm_rcv_0, '0']
+- [analog_wfm_rcv_0, '0', audio_sink_0, '0']
+
+metadata:
+  file_format: 1

@@ -1,0 +1,46 @@
+{
+  "server": {
+    "name": "Shared_baseband_Radio_server",
+    "host": "MSE-88",
+    "gui_enabled": true,
+    "state_sync": {
+      "qt_gui_updates_receivers": true,
+      "persist_on_change": true
+    }
+  },
+  "source": {
+    "type": "rtl_sdr",
+    "device_index": 0,
+    "center_frequency_hz": 90700000,
+    "sample_rate": 240000,
+    "gain_db": 25,
+    "ppm_correction": 135,
+    "bias_tee": false
+  },
+  "gui": {
+    "fft": true,
+    "waterfall": true,
+    "baseband_nudge_step_hz": 1000,
+    "show_receiver_list": true,
+    "show_frontend_controls": true
+  },
+  "audio": {
+    "clip_directory": "runtime/queue",
+    "min_clip_seconds": 1.0,
+    "hang_time_ms": 1200
+  },
+  "receivers": [
+    {
+      "id": "rx-1",
+      "name": "Receiver 1",
+      "enabled": true,
+      "mode": "wbfm",
+      "frequency_hz": 90700000,
+      "offset_hz": 0,
+      "bandwidth_hz": 180000,
+      "squelch": -50,
+      "audio_monitor": true,
+      "transcription_enabled": false
+    }
+  ]
+}
