@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Build a small static HTML page from runtime/transcripts/index.jsonl."""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+from pathlib import Path
+
+
+def load_records(jsonl_path: Path, limit: int) -> list[dict]:
+    records: list[dict] = []
+    if not jsonl_path.exists():
+        return records
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records[-limit:]
+
+
+def esc(value: object) -> str:
+    return html.escape("" if value is None else str(value))
+
+
+def build_page(records: list[dict], title: str) -> str:
+    cards: list[str] = []
+    for record in reversed(records):
+        created = esc(record.get("created_utc", ""))
+        filename = esc(record.get("file", ""))
+        receiver = esc(record.get("receiver", ""))
+        frequency = esc(record.get("frequency_hz", ""))
+        duration = esc(record.get("duration_sec", record.get("duration", "")))
+        text = esc(record.get("text", ""))
+        raw_text = esc(record.get("raw_text", ""))
+        error = esc(record.get("error", ""))
+
+        error_block = f'<p class="error">{error}</p>' if error else ""
+        raw_block = ""
+        if raw_text and raw_text != text:
+            raw_block = f"""
+            <details>
+              <summary>Raw transcript</summary>
+              <pre>{raw_text}</pre>
+            </details>
+            """
+
+        cards.append(f"""
+        <article class="card">
+          <div class="meta">
+            <strong>{created}</strong><br>
+            <span>{filename}</span><br>
+            <span>receiver={receiver} frequency={frequency}Hz duration={duration}s</span>
+          </div>
+          {error_block}
+          <p>{text}</p>
+          {raw_block}
+        </article>
+        """)
+
+    if not cards:
+        cards.append('<article class="card"><p>No transcripts yet.</p></article>')
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="20">
+  <title>{esc(title)}</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 1100px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      background: #101114;
+      color: #f0f0f0;
+    }}
+    header {{ margin-bottom: 1.5rem; }}
+    h1 {{ margin: 0 0 .25rem; font-size: 1.9rem; }}
+    .subtle {{ color: #a8a8a8; }}
+    .card {{
+      background: #1b1d22;
+      border: 1px solid #333842;
+      border-radius: 14px;
+      padding: 1rem 1.1rem;
+      margin: 1rem 0;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+    }}
+    .meta {{ color: #aeb4bf; font-size: .9rem; line-height: 1.4; margin-bottom: .7rem; }}
+    p {{ font-size: 1.08rem; line-height: 1.5; }}
+    pre {{ white-space: pre-wrap; color: #d1d5db; }}
+    details {{ margin-top: .75rem; }}
+    summary {{ cursor: pointer; color: #c9d4e5; }}
+    .error {{ color: #ffb4b4; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>{esc(title)}</h1>
+    <div class="subtle">Showing latest {len(records)} clips. Auto-refreshes every 20 seconds.</div>
+  </header>
+  {''.join(cards)}
+</body>
+</html>
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build transcript index.html from JSONL log")
+    parser.add_argument("--transcripts", default="runtime/transcripts")
+    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--title", default="SDR Audio Transcripts")
+    args = parser.parse_args()
+
+    transcript_dir = Path(args.transcripts)
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = transcript_dir / "index.jsonl"
+    html_path = transcript_dir / "index.html"
+
+    records = load_records(jsonl_path, args.limit)
+    html_path.write_text(build_page(records, args.title), encoding="utf-8")
+    print(f"wrote {html_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
