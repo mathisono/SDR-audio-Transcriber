@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+runtime/**/*.wav
+runtime/**/*.wav.part
+runtime/**/*.json
+runtime/**/*.jsonl
+runtime/transcripts/index.html
+!runtime/**/.gitkeep
