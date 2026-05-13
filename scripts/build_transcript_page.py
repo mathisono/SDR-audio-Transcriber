@@ -21,6 +21,8 @@ def load_records(jsonl_path: Path, limit: int) -> list[dict]:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
+    # Keep only the latest records, but preserve chronological order so the
+    # newest transcript appears at the bottom like a live radio log.
     return records[-limit:]
 
 
@@ -30,7 +32,7 @@ def esc(value: object) -> str:
 
 def build_page(records: list[dict], title: str) -> str:
     cards: list[str] = []
-    for record in reversed(records):
+    for record in records:
         created = esc(record.get("created_utc", ""))
         filename = esc(record.get("file", ""))
         receiver = esc(record.get("receiver", ""))
@@ -75,6 +77,7 @@ def build_page(records: list[dict], title: str) -> str:
   <title>{esc(title)}</title>
   <style>
     :root {{ color-scheme: dark; }}
+    html {{ scroll-behavior: smooth; }}
     body {{
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       max-width: 1100px;
@@ -100,14 +103,16 @@ def build_page(records: list[dict], title: str) -> str:
     details {{ margin-top: .75rem; }}
     summary {{ cursor: pointer; color: #c9d4e5; }}
     .error {{ color: #ffb4b4; }}
+    .bottom-anchor {{ height: 1px; }}
   </style>
 </head>
 <body>
   <header>
     <h1>{esc(title)}</h1>
-    <div class="subtle">Showing latest {len(records)} clips. Auto-refreshes every 20 seconds.</div>
+    <div class="subtle">Showing latest {len(records)} clips, oldest at top and newest at bottom. Auto-refreshes every 20 seconds.</div>
   </header>
   {''.join(cards)}
+  <div id="bottom" class="bottom-anchor"></div>
 </body>
 </html>
 """
