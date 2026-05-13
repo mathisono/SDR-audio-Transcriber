@@ -13,6 +13,32 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def parse_time(value: object) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def sort_key(record: dict) -> tuple[datetime, datetime, int]:
+    # Clip start time is the best radio timeline. If missing, fall back to the
+    # worker-created time, then JSONL record number. This makes every page read
+    # oldest -> newest, so scrolling up goes back in time.
+    return (
+        parse_time(record.get("started_utc") or record.get("created_utc")),
+        parse_time(record.get("created_utc") or record.get("started_utc")),
+        int(record.get("_record_number") or 0),
+    )
+
+
 def load_records(jsonl_path: Path) -> list[dict]:
     records: list[dict] = []
     if not jsonl_path.exists():
@@ -28,9 +54,7 @@ def load_records(jsonl_path: Path) -> list[dict]:
                 records.append(record)
             except json.JSONDecodeError:
                 continue
-    # Preserve chronological order so the newest transcript appears at the
-    # bottom like a live radio log. limit=0 is handled later and means full log.
-    return records
+    return sorted(records, key=sort_key)
 
 
 def esc(value: object) -> str:
@@ -38,8 +62,6 @@ def esc(value: object) -> str:
 
 
 def record_time(record: dict) -> str:
-    # created_utc is when the worker wrote the transcript. started_utc is when
-    # the clip began. Use both when available so the timeline is clearer.
     return str(record.get("created_utc") or record.get("started_utc") or "")
 
 
@@ -177,14 +199,15 @@ def render_cards(records: list[dict], text_key: str, include_compare: bool = Fal
 
 
 def timeline_summary(records: list[dict], total_records: int, generated_utc: str) -> str:
-    first = record_time(records[0]) if records else "none"
-    latest = record_time(records[-1]) if records else "none"
+    first = clip_time(records[0]) if records else "none"
+    latest = clip_time(records[-1]) if records else "none"
     latest_no = records[-1].get("_record_number") if records else "none"
     return f"""
     <article class="card status-card">
       <div><strong>Rendered records:</strong> {len(records)} of {total_records}</div>
-      <div><strong>First rendered:</strong> {esc(first)}</div>
-      <div><strong>Latest rendered:</strong> {esc(latest)} <span class="pill">record #{esc(latest_no)}</span></div>
+      <div><strong>Oldest rendered:</strong> {esc(first)}</div>
+      <div><strong>Newest rendered:</strong> {esc(latest)} <span class="pill">record #{esc(latest_no)}</span></div>
+      <div><strong>Sort order:</strong> oldest at top → newest at bottom. Scroll up to go back in time.</div>
       <div><strong>Page generated:</strong> {esc(generated_utc)}</div>
       <div class="muted">Raw Whisper Log is generated from <code>runtime/transcripts/index.jsonl</code>, not by reading WAV files directly.</div>
     </article>
@@ -359,7 +382,7 @@ def build_pages(records: list[dict], title: str, limit: int, total_records: int,
 
     return {
         "index.html": page_shell(title, f"Dashboard for SDR audio transcription views; showing {limit_note}.", "dashboard", counts, dashboard_body),
-        "raw.html": page_shell("Raw Whisper Log", f"Showing {limit_note}, oldest at top and newest at bottom.", "raw", counts, raw_body),
+        "raw.html": page_shell("Raw Whisper Log", f"Showing {limit_note}, oldest at top and newest at bottom. Scroll up to go back in time.", "raw", counts, raw_body),
         "processed.html": page_shell("Post-Processed Log", f"Showing {len(processed_records)} Qwen/LM Studio processed clips from {limit_note}, oldest at top and newest at bottom.", "processed", counts, processed_body),
         "classification.html": page_shell("Classification / Labels", f"Showing {len(classified_records)} classified clips from {limit_note}, oldest at top and newest at bottom.", "classification", counts, classification_body),
     }
