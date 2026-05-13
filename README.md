@@ -31,8 +31,11 @@ The GNU Radio flowgraph can stay focused on RF/demodulation while the clip write
 - `scripts/build_transcript_page.py`  
   Builds a simple auto-refreshing static web page at `runtime/transcripts/index.html`.
 
+- `scripts/ppm_config.py`  
+  Shows or sets the shared SDR source PPM correction in `configs/shared_baseband_radio_server.json`.
+
 - `scripts/audio_fft_ppm_finder_terminal.py`  
-  Existing terminal FFT and coarse PPM helper.
+  Existing terminal FFT and coarse PPM finder helper.
 
 - `install.sh`  
   Installs common Debian/Ubuntu packages, creates a Python virtual environment, installs Python dependencies, and creates the runtime folder structure.
@@ -66,15 +69,59 @@ pip install -r requirements.txt
 mkdir -p runtime/{queue,tmp,processing,done,failed,transcripts}
 ```
 
+## Shared PPM correction
+
+PPM correction is a single source-level setting. Set it once here:
+
+```text
+configs/shared_baseband_radio_server.json -> source.ppm_correction
+```
+
+All receivers and receiver test commands should use this same value.
+
+Show the current value:
+
+```bash
+python3 scripts/ppm_config.py show
+```
+
+Set the value once:
+
+```bash
+python3 scripts/ppm_config.py set 135
+```
+
+Generate `rtl_fm` arguments from config:
+
+```bash
+python3 scripts/ppm_config.py rtl-fm-args
+```
+
+Use the configured PPM value in a command:
+
+```bash
+PPM_ARGS="$(python3 scripts/ppm_config.py rtl-fm-args)"
+rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 ${PPM_ARGS} -
+```
+
+The existing coarse finder can also write the shared value directly:
+
+```bash
+python3 scripts/audio_fft_ppm_finder_terminal.py ppm \
+  --frequency 90700000 \
+  --write-config
+```
+
 ## First test using rtl_fm
 
 This bypasses GNU Radio and proves the audio capture/transcription pipeline first.
 
-Terminal 1: record squelch-gated clips from 90.7 MHz WBFM:
+Terminal 1: record squelch-gated clips from 90.7 MHz WBFM using the configured PPM value:
 
 ```bash
 source .venv/bin/activate
-rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 -p 135 - | \
+PPM_ARGS="$(python3 scripts/ppm_config.py rtl-fm-args)"
+rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 ${PPM_ARGS} - | \
   python3 scripts/clip_writer.py \
     --source MSE-88 \
     --frequency 90700000 \
