@@ -5,13 +5,14 @@ The worker treats runtime/queue/*.wav as complete input files. It moves each fil
 into runtime/processing, runs faster-whisper for speech-to-text, optionally asks
 an OpenAI-compatible model server such as LM Studio to clean up the rough
 transcript, optionally classifies CW/tone/spoken callsign evidence, writes
-JSON/JSONL outputs, rebuilds the simple HTML page, then moves finished audio into
-runtime/done.
+JSON/JSONL outputs, updates persistent classification state, rebuilds the simple
+HTML page, then moves finished audio into runtime/done.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -203,6 +204,159 @@ def choose_label(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def load_classification_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "version": 1,
+            "created_utc": utc_iso(),
+            "updated_utc": None,
+            "contexts": {},
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.setdefault("version", 1)
+        data.setdefault("contexts", {})
+        return data
+    except json.JSONDecodeError:
+        backup = path.with_suffix(path.suffix + f".bad-{int(time.time())}")
+        path.rename(backup)
+        return {
+            "version": 1,
+            "created_utc": utc_iso(),
+            "updated_utc": None,
+            "contexts": {},
+            "warning": f"Previous state was invalid JSON and was moved to {backup.name}",
+        }
+
+
+def save_classification_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def context_key(record: dict[str, Any]) -> str:
+    receiver = record.get("receiver") or "unknown_receiver"
+    frequency = record.get("frequency_hz") or "unknown_frequency"
+    return f"{receiver}@{frequency}Hz"
+
+
+def evidence_weight(candidate: dict[str, Any]) -> float:
+    base = float(candidate.get("confidence", 0.0) or 0.0)
+    kind = candidate.get("type")
+    source = candidate.get("source")
+    multiplier = 1.0
+    if kind == "cw_callsign" or source == "cw_audio_decode":
+        multiplier = 1.7
+    elif kind == "spoken_callsign":
+        multiplier = 1.0
+    elif kind == "tone_id_frequency":
+        multiplier = 0.65
+    return max(0.05, min(2.0, base * multiplier))
+
+
+def stable_confidence(count: int, weighted_score: float, best_seen_confidence: float) -> float:
+    # Repetition builds certainty but with diminishing returns. CW IDs climb
+    # faster because their weight is higher; tone-only evidence stays weaker.
+    repeat_component = 1.0 - math.exp(-max(0.0, weighted_score) / 3.0)
+    count_component = 1.0 - math.exp(-max(0, count) / 5.0)
+    confidence = (0.55 * repeat_component) + (0.30 * count_component) + (0.15 * best_seen_confidence)
+    return round(max(0.0, min(0.99, confidence)), 3)
+
+
+def update_classification_state(path: Path, record: dict[str, Any]) -> dict[str, Any]:
+    state = load_classification_state(path)
+    now = utc_iso()
+    key = context_key(record)
+    contexts = state.setdefault("contexts", {})
+    context = contexts.setdefault(
+        key,
+        {
+            "receiver": record.get("receiver"),
+            "frequency_hz": record.get("frequency_hz"),
+            "frequency_label": record.get("frequency_label"),
+            "first_seen_utc": now,
+            "last_seen_utc": None,
+            "clip_count": 0,
+            "evidence": {},
+            "promoted_label": None,
+            "recent_files": [],
+        },
+    )
+    context["last_seen_utc"] = now
+    context["clip_count"] = int(context.get("clip_count", 0)) + 1
+    context["receiver"] = record.get("receiver", context.get("receiver"))
+    context["frequency_hz"] = record.get("frequency_hz", context.get("frequency_hz"))
+    context["frequency_label"] = record.get("frequency_label", context.get("frequency_label"))
+
+    recent_files = context.setdefault("recent_files", [])
+    recent_files.append(record.get("file"))
+    context["recent_files"] = [item for item in recent_files if item][-20:]
+
+    evidence = context.setdefault("evidence", {})
+    for candidate in record.get("label_candidates") or []:
+        label = str(candidate.get("label") or "").strip()
+        if not label:
+            continue
+        item = evidence.setdefault(
+            label,
+            {
+                "label": label,
+                "count": 0,
+                "weighted_score": 0.0,
+                "best_seen_confidence": 0.0,
+                "sources": {},
+                "types": {},
+                "first_seen_utc": now,
+                "last_seen_utc": None,
+                "last_file": None,
+                "stable_confidence": 0.0,
+            },
+        )
+        item["count"] = int(item.get("count", 0)) + 1
+        item["last_seen_utc"] = now
+        item["last_file"] = record.get("file")
+        candidate_conf = float(candidate.get("confidence", 0.0) or 0.0)
+        item["best_seen_confidence"] = max(float(item.get("best_seen_confidence", 0.0)), candidate_conf)
+        item["weighted_score"] = round(float(item.get("weighted_score", 0.0)) + evidence_weight(candidate), 3)
+
+        source = str(candidate.get("source") or "unknown")
+        kind = str(candidate.get("type") or "unknown")
+        item.setdefault("sources", {})[source] = int(item.setdefault("sources", {}).get(source, 0)) + 1
+        item.setdefault("types", {})[kind] = int(item.setdefault("types", {}).get(kind, 0)) + 1
+        item["stable_confidence"] = stable_confidence(
+            int(item.get("count", 0)),
+            float(item.get("weighted_score", 0.0)),
+            float(item.get("best_seen_confidence", 0.0)),
+        )
+
+    ranked = sorted(
+        evidence.values(),
+        key=lambda item: (float(item.get("stable_confidence", 0.0)), float(item.get("weighted_score", 0.0)), int(item.get("count", 0))),
+        reverse=True,
+    )
+    if ranked:
+        best = ranked[0]
+        context["promoted_label"] = {
+            "label": best.get("label"),
+            "stable_confidence": best.get("stable_confidence", 0.0),
+            "count": best.get("count", 0),
+            "weighted_score": best.get("weighted_score", 0.0),
+            "sources": best.get("sources", {}),
+            "updated_utc": now,
+        }
+
+    state["updated_utc"] = now
+    save_classification_state(path, state)
+    return {
+        "context_key": key,
+        "promoted_label": context.get("promoted_label"),
+        "clip_count": context.get("clip_count", 0),
+        "state_path": str(path),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Watch runtime/queue and transcribe completed WAV clips")
     parser.add_argument("--queue", default="runtime/queue")
@@ -210,6 +364,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--done", default="runtime/done")
     parser.add_argument("--failed", default="runtime/failed")
     parser.add_argument("--transcripts", default="runtime/transcripts")
+    parser.add_argument("--classification-state", default="runtime/classification_state.json")
     parser.add_argument("--whisper-model", default="small.en")
     parser.add_argument("--device", default="cpu", help="cpu or cuda")
     parser.add_argument("--compute-type", default="int8", help="int8 for CPU, float16 for CUDA")
@@ -232,9 +387,10 @@ def main() -> int:
     done = Path(args.done)
     failed = Path(args.failed)
     transcripts = Path(args.transcripts)
+    classification_state_path = Path(args.classification_state)
     lmstudio_url = normalize_lmstudio_url(args.lmstudio_host, args.lmstudio_port, args.lmstudio_url)
 
-    for directory in [queue, processing, done, failed, transcripts]:
+    for directory in [queue, processing, done, failed, transcripts, classification_state_path.parent]:
         directory.mkdir(parents=True, exist_ok=True)
 
     jsonl_path = transcripts / "index.jsonl"
@@ -253,7 +409,7 @@ def main() -> int:
     else:
         print(f"worker: cleanup endpoint {lmstudio_url} model={args.cleanup_model}", flush=True)
     if args.enable_classifier:
-        print("worker: classifier enabled", flush=True)
+        print(f"worker: classifier enabled state={classification_state_path}", flush=True)
 
     while True:
         wavs = sorted(queue.glob("*.wav"))
@@ -317,6 +473,12 @@ def main() -> int:
                 "label_candidates": label_candidates,
                 "label": label,
             }
+
+            if args.enable_classifier:
+                record["classification_state"] = update_classification_state(classification_state_path, record)
+                promoted = (record["classification_state"].get("promoted_label") or {})
+                if promoted.get("label"):
+                    record["stable_label"] = promoted
 
             output_json = done / f"{proc.stem}.transcript.json"
             output_json.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
