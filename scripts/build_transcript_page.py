@@ -5,31 +5,46 @@ from __future__ import annotations
 import argparse
 import html
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 
-def load_records(jsonl_path: Path, limit: int) -> list[dict]:
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def load_records(jsonl_path: Path) -> list[dict]:
     records: list[dict] = []
     if not jsonl_path.exists():
         return records
     with jsonl_path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
+                record["_record_number"] = line_number
+                records.append(record)
             except json.JSONDecodeError:
                 continue
     # Preserve chronological order so the newest transcript appears at the
-    # bottom like a live radio log. limit=0 means show the full JSONL history.
-    if limit and limit > 0:
-        return records[-limit:]
+    # bottom like a live radio log. limit=0 is handled later and means full log.
     return records
 
 
 def esc(value: object) -> str:
     return html.escape("" if value is None else str(value))
+
+
+def record_time(record: dict) -> str:
+    # created_utc is when the worker wrote the transcript. started_utc is when
+    # the clip began. Use both when available so the timeline is clearer.
+    return str(record.get("created_utc") or record.get("started_utc") or "")
+
+
+def clip_time(record: dict) -> str:
+    return str(record.get("started_utc") or record.get("created_utc") or "")
 
 
 def is_post_processed(record: dict) -> bool:
@@ -95,15 +110,19 @@ def render_label_block(record: dict) -> str:
     return f'<div class="label-block">{"".join(parts)}</div>'
 
 
-def render_card(record: dict, text_key: str, include_compare: bool = False, include_labels: bool = True) -> str:
-    created = esc(record.get("created_utc", ""))
+def render_card(record: dict, text_key: str, include_compare: bool = False, include_labels: bool = True, compact_raw: bool = False) -> str:
+    rec_no = esc(record.get("_record_number", ""))
+    created = esc(record_time(record))
+    started = esc(clip_time(record))
     filename = esc(record.get("file", ""))
     receiver = esc(record.get("receiver", ""))
+    source = esc(record.get("source", ""))
     frequency = esc(record.get("frequency_hz", ""))
     frequency_label = esc(record.get("frequency_label", ""))
     duration = esc(record.get("duration_sec", record.get("duration", "")))
     raw_text = esc(record.get("raw_text", ""))
-    text = esc(record.get(text_key, ""))
+    text_value = record.get(text_key, "")
+    text = esc(text_value if text_value else "[no transcript text]")
     error = esc(record.get("error", ""))
     cleanup_model = esc(record.get("cleanup_model", ""))
     cleanup_endpoint = esc(record.get("cleanup_endpoint", ""))
@@ -130,12 +149,16 @@ def render_card(record: dict, text_key: str, include_compare: bool = False, incl
         </details>
         """
 
+    meta_extra = ""
+    if compact_raw:
+        meta_extra = f"<br><span>source={source} started={started} record=#{rec_no}</span>"
+
     return f"""
-    <article class="card">
+    <article class="card" id="record-{rec_no}">
       <div class="meta">
-        <strong>{created}</strong><br>
+        <strong>#{rec_no} — {created}</strong><br>
         <span>{filename}</span><br>
-        <span>receiver={receiver} frequency={freq_display} duration={duration}s</span>{status_line}
+        <span>receiver={receiver} frequency={freq_display} duration={duration}s</span>{meta_extra}{status_line}
       </div>
       {error_block}
       {cleanup_error_block}
@@ -146,11 +169,26 @@ def render_card(record: dict, text_key: str, include_compare: bool = False, incl
     """
 
 
-def render_cards(records: list[dict], text_key: str, include_compare: bool = False, include_labels: bool = True) -> str:
-    cards = [render_card(record, text_key=text_key, include_compare=include_compare, include_labels=include_labels) for record in records]
+def render_cards(records: list[dict], text_key: str, include_compare: bool = False, include_labels: bool = True, compact_raw: bool = False) -> str:
+    cards = [render_card(record, text_key=text_key, include_compare=include_compare, include_labels=include_labels, compact_raw=compact_raw) for record in records]
     if not cards:
         cards.append('<article class="card"><p>No transcripts yet.</p></article>')
     return "".join(cards)
+
+
+def timeline_summary(records: list[dict], total_records: int, generated_utc: str) -> str:
+    first = record_time(records[0]) if records else "none"
+    latest = record_time(records[-1]) if records else "none"
+    latest_no = records[-1].get("_record_number") if records else "none"
+    return f"""
+    <article class="card status-card">
+      <div><strong>Rendered records:</strong> {len(records)} of {total_records}</div>
+      <div><strong>First rendered:</strong> {esc(first)}</div>
+      <div><strong>Latest rendered:</strong> {esc(latest)} <span class="pill">record #{esc(latest_no)}</span></div>
+      <div><strong>Page generated:</strong> {esc(generated_utc)}</div>
+      <div class="muted">Raw Whisper Log is generated from <code>runtime/transcripts/index.jsonl</code>, not by reading WAV files directly.</div>
+    </article>
+    """
 
 
 def stylesheet() -> str:
@@ -161,13 +199,14 @@ def stylesheet() -> str:
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       max-width: 1100px;
       margin: 2rem auto;
-      padding: 0 1rem;
+      padding: 0 1rem 4rem;
       background: #101114;
       color: #f0f0f0;
     }
     header { margin-bottom: 1.5rem; }
     h1 { margin: 0 0 .25rem; font-size: 1.9rem; }
     .subtle, .muted { color: #a8a8a8; }
+    code { color: #d8e1f0; }
     .tabs {
       display: flex;
       gap: .5rem;
@@ -208,6 +247,7 @@ def stylesheet() -> str:
       margin: 1rem 0;
       box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
     }
+    .status-card { line-height: 1.65; }
     .meta { color: #aeb4bf; font-size: .9rem; line-height: 1.4; margin-bottom: .7rem; }
     .label-block { background: #141821; border: 1px solid #2c3444; border-radius: 10px; padding: .7rem .8rem; margin: .75rem 0; }
     .label-best { margin-bottom: .35rem; }
@@ -219,6 +259,13 @@ def stylesheet() -> str:
     details { margin-top: .75rem; }
     summary { cursor: pointer; color: #c9d4e5; }
     .error { color: #ffb4b4; }
+    .floating-bottom {
+      position: fixed;
+      right: 1rem;
+      bottom: 1rem;
+      z-index: 5;
+      box-shadow: 0 8px 24px rgba(0,0,0,.35);
+    }
     """
 
 
@@ -244,6 +291,8 @@ def page_shell(title: str, subtitle: str, active: str, counts: dict[str, int], b
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="20">
+  <meta http-equiv="Cache-Control" content="no-store">
+  <meta http-equiv="Pragma" content="no-cache">
   <title>{esc(title)}</title>
   <style>{stylesheet()}</style>
 </head>
@@ -259,7 +308,7 @@ def page_shell(title: str, subtitle: str, active: str, counts: dict[str, int], b
 """
 
 
-def build_pages(records: list[dict], title: str, limit: int, total_records: int) -> dict[str, str]:
+def build_pages(records: list[dict], title: str, limit: int, total_records: int, generated_utc: str) -> dict[str, str]:
     processed_records = [record for record in records if is_post_processed(record)]
     classified_records = [record for record in records if has_classification(record)]
     limit_note = "full log" if not limit or limit <= 0 else f"latest {len(records)} of {total_records} records"
@@ -277,17 +326,20 @@ def build_pages(records: list[dict], title: str, limit: int, total_records: int)
     </section>
     <section>
       <h2 class="section-title">Status</h2>
-      <article class="card">
-        <p>Newest records appear at the bottom of each log page. Current build is showing: {esc(limit_note)}.</p>
-        <p class="muted">These pages are generated from runtime/transcripts/index.jsonl, not by reading WAV files directly.</p>
-      </article>
+      {timeline_summary(records, total_records, generated_utc)}
     </section>
     """
 
     raw_body = f"""
     <section>
+      <h2 class="section-title">Timeline</h2>
+      {timeline_summary(records, total_records, generated_utc)}
+      <a class="tab floating-bottom" href="#latest-record">Jump to latest</a>
+    </section>
+    <section>
       <h2 class="section-title">Raw Whisper Log</h2>
-      {render_cards(records, text_key="raw_text", include_compare=False, include_labels=True)}
+      {render_cards(records, text_key="raw_text", include_compare=False, include_labels=True, compact_raw=True)}
+      <div id="latest-record"></div>
     </section>
     """
 
@@ -324,14 +376,15 @@ def main() -> int:
     transcript_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = transcript_dir / "index.jsonl"
 
-    all_records = load_records(jsonl_path, 0)
+    all_records = load_records(jsonl_path)
     records = all_records if args.limit <= 0 else all_records[-args.limit:]
-    pages = build_pages(records, args.title, args.limit, len(all_records))
+    generated_utc = now_utc()
+    pages = build_pages(records, args.title, args.limit, len(all_records), generated_utc)
     for filename, content in pages.items():
         path = transcript_dir / filename
         path.write_text(content, encoding="utf-8")
         print(f"wrote {path}")
-    print(f"rendered {len(records)} of {len(all_records)} records (limit={args.limit})")
+    print(f"rendered {len(records)} of {len(all_records)} records (limit={args.limit}) generated={generated_utc}")
     return 0
 
 
