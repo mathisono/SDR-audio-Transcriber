@@ -158,10 +158,13 @@ def spoken_callsign_candidates(*texts: str) -> list[dict[str, Any]]:
     return candidates
 
 
-def run_clip_classifier(wav_path: Path) -> dict[str, Any]:
+def run_clip_classifier(wav_path: Path, cw_external_command: str = "", cw_external_timeout: int = 20) -> dict[str, Any]:
     script_path = Path(__file__).with_name("clip_classifier.py")
+    cmd = ["python3", str(script_path), str(wav_path)]
+    if cw_external_command:
+        cmd.extend(["--cw-external-command", cw_external_command, "--cw-external-timeout", str(cw_external_timeout)])
     result = subprocess.run(
-        ["python3", str(script_path), str(wav_path)],
+        cmd,
         capture_output=True,
         text=True,
         check=False,
@@ -247,7 +250,7 @@ def evidence_weight(candidate: dict[str, Any]) -> float:
     kind = candidate.get("type")
     source = candidate.get("source")
     multiplier = 1.0
-    if kind == "cw_callsign" or source == "cw_audio_decode":
+    if kind == "cw_callsign" or source in {"cw_audio_decode", "external_cw_decoder"}:
         multiplier = 1.7
     elif kind == "spoken_callsign":
         multiplier = 1.0
@@ -257,8 +260,6 @@ def evidence_weight(candidate: dict[str, Any]) -> float:
 
 
 def stable_confidence(count: int, weighted_score: float, best_seen_confidence: float) -> float:
-    # Repetition builds certainty but with diminishing returns. CW IDs climb
-    # faster because their weight is higher; tone-only evidence stays weaker.
     repeat_component = 1.0 - math.exp(-max(0.0, weighted_score) / 3.0)
     count_component = 1.0 - math.exp(-max(0, count) / 5.0)
     confidence = (0.55 * repeat_component) + (0.30 * count_component) + (0.15 * best_seen_confidence)
@@ -375,6 +376,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cleanup-timeout", type=int, default=120)
     parser.add_argument("--no-cleanup", action="store_true", help="Skip local LLM cleanup step")
     parser.add_argument("--enable-classifier", action="store_true", help="Enable CW/tone/spoken callsign label candidates")
+    parser.add_argument("--cw-external-command", default="", help="Optional external CW decoder command. Use {wav} placeholder or WAV path is appended.")
+    parser.add_argument("--cw-external-timeout", type=int, default=20)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     return parser.parse_args()
 
@@ -410,6 +413,8 @@ def main() -> int:
         print(f"worker: cleanup endpoint {lmstudio_url} model={args.cleanup_model}", flush=True)
     if args.enable_classifier:
         print(f"worker: classifier enabled state={classification_state_path}", flush=True)
+        if args.cw_external_command:
+            print(f"worker: external CW decoder command={args.cw_external_command}", flush=True)
 
     while True:
         wavs = sorted(queue.glob("*.wav"))
@@ -440,13 +445,13 @@ def main() -> int:
                         args.cleanup_model,
                         args.cleanup_timeout,
                     )
-                except Exception as exc:  # Keep the transcript even if cleanup fails.
+                except Exception as exc:
                     cleanup_error = str(exc)
                     clean_text = raw_text
 
             classification: dict[str, Any] = {"enabled": False, "label_candidates": []}
             if args.enable_classifier:
-                classification = run_clip_classifier(proc)
+                classification = run_clip_classifier(proc, args.cw_external_command, args.cw_external_timeout)
 
             spoken_candidates = spoken_callsign_candidates(raw_text, clean_text)
             label_candidates = merge_label_candidates(
