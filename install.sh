@@ -19,17 +19,27 @@ if command -v apt-get >/dev/null 2>&1; then
     python3 \
     python3-venv \
     python3-pip \
+    python3-dev \
+    build-essential \
+    pkg-config \
     rtl-sdr \
     sox \
     ffmpeg \
-    libsndfile1
+    libsndfile1 \
+    libavformat-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavutil-dev \
+    libavfilter-dev \
+    libswscale-dev \
+    libswresample-dev
 
   if apt-cache show gnuradio >/dev/null 2>&1; then
     sudo apt-get install -y gnuradio gr-osmosdr || true
   fi
 else
   echo "apt-get not found. Install these packages manually if needed:"
-  echo "  python3 python3-venv python3-pip rtl-sdr sox ffmpeg libsndfile gnuradio gr-osmosdr"
+  echo "  python3 python3-venv python3-pip python3-dev build-essential pkg-config rtl-sdr sox ffmpeg libsndfile gnuradio gr-osmosdr"
 fi
 
 echo "Creating runtime folder structure..."
@@ -51,7 +61,8 @@ python3 -m venv "${VENV_DIR}"
 # shellcheck source=/dev/null
 source "${VENV_DIR}/bin/activate"
 python -m pip install --upgrade pip wheel setuptools
-python -m pip install -r "${ROOT_DIR}/requirements.txt"
+python -m pip install "Cython==0.29.37"
+PIP_CONSTRAINT="${ROOT_DIR}/constraints-python38.txt" python -m pip install -r "${ROOT_DIR}/requirements.txt"
 
 chmod +x \
   "${ROOT_DIR}/scripts/clip_writer.py" \
