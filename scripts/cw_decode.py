@@ -37,8 +37,6 @@ MORSE_TABLE = {
     "-....-": "-", "-...-": "=", ".-.-.": "+", ".--.-.": "@", "-.-.--": "!",
 }
 
-# Conservative amateur callsign pattern. This is used only to generate label
-# candidates and boost confidence; the raw decoded text is still preserved.
 CALLSIGN_RE = re.compile(r"\b(?:[AKNW][A-Z]?\d[A-Z]{1,3}|[A-Z]{1,2}\d[A-Z]{1,4})\b", re.IGNORECASE)
 
 
@@ -101,7 +99,6 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 def estimate_tone(sample_rate: int, samples: list[float], low_hz: int, high_hz: int) -> dict[str, Any]:
-    # Use enough audio to find the ID tone, but keep it cheap on Pi-class hosts.
     window = samples[: min(len(samples), sample_rate * 15)]
     if len(window) < sample_rate // 2:
         return {"detected": False, "reason": "clip too short"}
@@ -132,7 +129,6 @@ def tone_envelope(sample_rate: int, samples: list[float], freq_hz: float, frame_
     powers: list[float] = []
     for start in range(0, len(samples) - frame_len + 1, frame_len):
         frame = samples[start:start + frame_len]
-        # sqrt compresses large power swings and makes thresholding less brittle.
         powers.append(math.sqrt(goertzel_power(frame, sample_rate, freq_hz)))
         times.append(start / sample_rate)
     smoothed = moving_average(powers, smooth_frames)
@@ -145,7 +141,6 @@ def activity_from_envelope(envelope: list[tuple[float, float]]) -> tuple[list[bo
         return [], {"threshold": 0.0}
     noise = percentile(values, 0.20)
     high = percentile(values, 0.90)
-    # Hysteresis helps prevent chattery key-down/key-up edges.
     on_threshold = noise + (high - noise) * 0.45
     off_threshold = noise + (high - noise) * 0.28
     active = False
@@ -186,7 +181,6 @@ def runs_from_activity(activity: list[bool], frame_ms: int) -> list[tuple[bool, 
 
 
 def merge_short_runs(runs: list[tuple[bool, float]], min_duration: float) -> list[tuple[bool, float]]:
-    # Very short flips are usually noise at a key edge. Merge them into neighbors.
     changed = True
     result = runs[:]
     while changed and len(result) >= 3:
@@ -213,35 +207,49 @@ def dit_from_wpm(wpm: float) -> float:
     return 1.2 / wpm
 
 
-def estimate_dit(runs: list[tuple[bool, float]], wpm_min: float, wpm_max: float) -> dict[str, Any]:
+def estimate_dit(runs: list[tuple[bool, float]], wpm_min: float, wpm_max: float, use_wpm_prior: bool) -> dict[str, Any]:
     on = [duration for active, duration in runs if active]
     if not on:
         return {"ok": False, "reason": "no key-down runs"}
 
-    min_dit = dit_from_wpm(wpm_max)  # fast CW -> short dit
-    max_dit = dit_from_wpm(wpm_min)  # slow CW -> long dit
+    min_dit = dit_from_wpm(wpm_max)
+    max_dit = dit_from_wpm(wpm_min)
+    prior_wpm = (wpm_min + wpm_max) / 2.0
+    prior_dit = dit_from_wpm(prior_wpm)
+
     candidates = [d for d in on if min_dit * 0.55 <= d <= max_dit * 1.55]
     if not candidates:
         candidates = on
     candidates.sort()
 
-    # Prefer the lower cluster because dahs are roughly 3 dits and would skew
-    # the median upward. This is the main timing improvement over the first pass.
-    low_cluster = candidates[: max(1, math.ceil(len(candidates) * 0.45))]
-    dit = statistics.median(low_cluster)
-    dit = max(min_dit * 0.55, min(max_dit * 1.55, dit))
+    dot_cluster = candidates[: max(1, math.ceil(len(candidates) * 0.25))]
+    measured_dit = percentile(dot_cluster, 0.15)
+    measured_dit = max(min_dit * 0.55, min(max_dit * 1.55, measured_dit))
+
+    # Practice files and repeater IDs often have clean known WPM. When smoothing
+    # stretches the shortest key-down run, the WPM prior gives better spacing.
+    if use_wpm_prior and measured_dit > prior_dit * 1.25:
+        dit = prior_dit
+        source = "wpm_prior"
+    else:
+        dit = measured_dit
+        source = "measured"
+
     wpm = 1.2 / dit if dit else 0.0
     return {
         "ok": True,
         "dit_seconds": round(dit, 4),
         "estimated_wpm": round(wpm, 2),
+        "source": source,
+        "measured_dit_seconds": round(measured_dit, 4),
+        "prior_dit_seconds": round(prior_dit, 4),
         "wpm_min": wpm_min,
         "wpm_max": wpm_max,
         "on_durations": [round(x, 4) for x in on[:80]],
     }
 
 
-def decode_runs(runs: list[tuple[bool, float]], dit: float) -> dict[str, Any]:
+def decode_runs(runs: list[tuple[bool, float]], dit: float, char_gap_units: float, word_gap_units: float) -> dict[str, Any]:
     symbols: list[str] = []
     current = ""
     for active, duration in runs:
@@ -249,13 +257,12 @@ def decode_runs(runs: list[tuple[bool, float]], dit: float) -> dict[str, Any]:
         if active:
             current += "." if units < 2.15 else "-"
         else:
-            # Morse timing: intra char = 1, character gap = 3, word gap = 7.
-            if units >= 6.0:
+            if units >= word_gap_units:
                 if current:
                     symbols.append(current)
                     current = ""
                 symbols.append("/")
-            elif units >= 2.25:
+            elif units >= char_gap_units:
                 if current:
                     symbols.append(current)
                     current = ""
@@ -265,21 +272,22 @@ def decode_runs(runs: list[tuple[bool, float]], dit: float) -> dict[str, Any]:
         symbols.append(current)
 
     decoded_chars = [" " if sym == "/" else MORSE_TABLE.get(sym, "?") for sym in symbols]
-    text = "".join(decoded_chars)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", "".join(decoded_chars)).strip()
     good = sum(1 for c in decoded_chars if c not in {"?"})
     non_space = sum(1 for c in decoded_chars if c != " ") or 1
-    confidence = good / non_space
+    base_confidence = good / non_space
     callsigns = extract_callsigns(text)
-    if callsigns:
-        confidence = min(0.99, confidence + 0.12)
+    confidence = min(0.99, base_confidence + 0.08) if callsigns and base_confidence >= 0.70 else base_confidence
     return {
         "decoded": bool(text),
         "symbols": " ".join(symbols),
         "text": text,
         "confidence": round(confidence, 3),
+        "base_confidence": round(base_confidence, 3),
         "callsigns": callsigns,
         "unknown_symbols": decoded_chars.count("?"),
+        "char_gap_units": char_gap_units,
+        "word_gap_units": word_gap_units,
     }
 
 
@@ -295,12 +303,16 @@ def decode_wav(
     smooth_frames: int = 2,
     expected_wpm_min: float = 8.0,
     expected_wpm_max: float = 30.0,
+    use_wpm_prior: bool = True,
+    char_gap_units: float = 1.75,
+    word_gap_units: float = 5.0,
+    label_min_confidence: float = 0.72,
 ) -> dict[str, Any]:
     sample_rate, samples = read_wav_mono(path)
     duration = len(samples) / sample_rate if sample_rate else 0.0
     tone = estimate_tone(sample_rate, samples, low_hz, high_hz)
     result: dict[str, Any] = {
-        "engine": "cw_decode_dsp_v2",
+        "engine": "cw_decode_dsp_v3",
         "file": path.name,
         "sample_rate": sample_rate,
         "duration_sec": round(duration, 3),
@@ -329,13 +341,13 @@ def decode_wav(
         result["reason"] = "tone is not keyed like CW"
         return result
 
-    timing = estimate_dit(runs, expected_wpm_min, expected_wpm_max)
+    timing = estimate_dit(runs, expected_wpm_min, expected_wpm_max, use_wpm_prior)
     result["timing"] = timing
     if not timing.get("ok"):
         result["reason"] = timing.get("reason", "timing failed")
         return result
 
-    decoded = decode_runs(runs, float(timing["dit_seconds"]))
+    decoded = decode_runs(runs, float(timing["dit_seconds"]), char_gap_units, word_gap_units)
     result.update(decoded)
     result["label_candidates"] = [
         {
@@ -343,9 +355,10 @@ def decode_wav(
             "label": callsign,
             "value": callsign,
             "confidence": result.get("confidence", 0.0),
-            "source": "cw_decode_dsp_v2",
+            "source": "cw_decode_dsp_v3",
         }
         for callsign in result.get("callsigns", [])
+        if float(result.get("confidence", 0.0)) >= label_min_confidence
     ]
     return result
 
@@ -359,6 +372,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-frames", type=int, default=2)
     parser.add_argument("--expected-wpm-min", type=float, default=8.0)
     parser.add_argument("--expected-wpm-max", type=float, default=30.0)
+    parser.add_argument("--no-wpm-prior", action="store_true", help="Use only measured timing; do not pull dit timing toward expected WPM")
+    parser.add_argument("--char-gap-units", type=float, default=1.75)
+    parser.add_argument("--word-gap-units", type=float, default=5.0)
+    parser.add_argument("--label-min-confidence", type=float, default=0.72)
     parser.add_argument("--text-only", action="store_true")
     parser.add_argument("--pretty", action="store_true")
     return parser.parse_args()
@@ -374,6 +391,10 @@ def main() -> int:
         smooth_frames=args.smooth_frames,
         expected_wpm_min=args.expected_wpm_min,
         expected_wpm_max=args.expected_wpm_max,
+        use_wpm_prior=not args.no_wpm_prior,
+        char_gap_units=args.char_gap_units,
+        word_gap_units=args.word_gap_units,
+        label_min_confidence=args.label_min_confidence,
     )
     if args.text_only:
         print(result.get("text", ""))
