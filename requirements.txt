@@ -1,2 +1,4 @@
-faster-whisper>=1.1.0
+# MSE-88 may be on an older distro Python. faster-whisper 0.10.1 supports Python 3.8+.
+# Newer faster-whisper releases require Python 3.9+.
+faster-whisper==0.10.1
 requests>=2.31.0
