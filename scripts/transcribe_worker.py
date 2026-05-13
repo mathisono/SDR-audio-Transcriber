@@ -4,13 +4,15 @@
 The worker treats runtime/queue/*.wav as complete input files. It moves each file
 into runtime/processing, runs faster-whisper for speech-to-text, optionally asks
 an OpenAI-compatible model server such as LM Studio to clean up the rough
-transcript, writes JSON/JSONL outputs, rebuilds the simple HTML page, then moves
-finished audio into runtime/done.
+transcript, optionally classifies CW/tone/spoken callsign evidence, writes
+JSON/JSONL outputs, rebuilds the simple HTML page, then moves finished audio into
+runtime/done.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -21,22 +23,15 @@ from typing import Any
 import requests
 from faster_whisper import WhisperModel
 
+CALLSIGN_RE = re.compile(r"\b(?:[AKNW][A-Z]?\d[A-Z]{1,3}|[A-Z]{1,2}\d[A-Z]{1,4})\b", re.IGNORECASE)
+
 
 def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def normalize_lmstudio_url(host: str | None, port: int, url: str | None) -> str:
-    """Return an OpenAI-compatible /v1 base URL for LM Studio.
-
-    Users can provide either:
-      --lmstudio-host 192.168.3.28
-      --lmstudio-host 192.168.3.28:1234
-      --lmstudio-url http://192.168.3.28:1234/v1
-
-    A full URL wins over host/port. If a host includes http://, it is treated as
-    a URL-like host and normalized to include /v1 when missing.
-    """
+    """Return an OpenAI-compatible /v1 base URL for LM Studio."""
     if url:
         base = url.strip().rstrip("/")
     else:
@@ -143,6 +138,71 @@ def transcribe_file(model: WhisperModel, wav_path: Path) -> tuple[str, list[dict
     return " ".join(parts).strip(), segment_data, info
 
 
+def spoken_callsign_candidates(*texts: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for text in texts:
+        for match in CALLSIGN_RE.finditer(text or ""):
+            callsign = match.group(0).upper()
+            if callsign in seen:
+                continue
+            seen.add(callsign)
+            candidates.append({
+                "type": "spoken_callsign",
+                "label": callsign,
+                "value": callsign,
+                "confidence": 0.55,
+                "source": "transcript_regex",
+            })
+    return candidates
+
+
+def run_clip_classifier(wav_path: Path) -> dict[str, Any]:
+    script_path = Path(__file__).with_name("clip_classifier.py")
+    result = subprocess.run(
+        ["python3", str(script_path), str(wav_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {
+            "enabled": True,
+            "error": result.stderr.strip() or f"classifier exited {result.returncode}",
+            "label_candidates": [],
+        }
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return {"enabled": True, "error": str(exc), "label_candidates": []}
+
+
+def merge_label_candidates(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for group in groups:
+        for candidate in group:
+            key = (str(candidate.get("type", "")), str(candidate.get("label", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
+    merged.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+    return merged
+
+
+def choose_label(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    if not candidates:
+        return {"label": None, "confidence": 0.0, "source": None}
+    best = candidates[0]
+    return {
+        "label": best.get("label"),
+        "confidence": best.get("confidence", 0.0),
+        "source": best.get("source"),
+        "type": best.get("type"),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Watch runtime/queue and transcribe completed WAV clips")
     parser.add_argument("--queue", default="runtime/queue")
@@ -159,6 +219,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cleanup-model", default="bingbangboom/Qwen3508B-transcriber-15k-03")
     parser.add_argument("--cleanup-timeout", type=int, default=120)
     parser.add_argument("--no-cleanup", action="store_true", help="Skip local LLM cleanup step")
+    parser.add_argument("--enable-classifier", action="store_true", help="Enable CW/tone/spoken callsign label candidates")
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     return parser.parse_args()
 
@@ -191,6 +252,8 @@ def main() -> int:
         print("worker: cleanup disabled", flush=True)
     else:
         print(f"worker: cleanup endpoint {lmstudio_url} model={args.cleanup_model}", flush=True)
+    if args.enable_classifier:
+        print("worker: classifier enabled", flush=True)
 
     while True:
         wavs = sorted(queue.glob("*.wav"))
@@ -225,6 +288,17 @@ def main() -> int:
                     cleanup_error = str(exc)
                     clean_text = raw_text
 
+            classification: dict[str, Any] = {"enabled": False, "label_candidates": []}
+            if args.enable_classifier:
+                classification = run_clip_classifier(proc)
+
+            spoken_candidates = spoken_callsign_candidates(raw_text, clean_text)
+            label_candidates = merge_label_candidates(
+                classification.get("label_candidates", []),
+                spoken_candidates,
+            )
+            label = choose_label(label_candidates)
+
             duration = sidecar_metadata.get("duration_sec", getattr(info, "duration", None))
             record: dict[str, Any] = {
                 **sidecar_metadata,
@@ -239,6 +313,9 @@ def main() -> int:
                 "cleanup_model": None if args.no_cleanup else args.cleanup_model,
                 "cleanup_endpoint": None if args.no_cleanup else lmstudio_url,
                 "cleanup_error": cleanup_error,
+                "classification": classification,
+                "label_candidates": label_candidates,
+                "label": label,
             }
 
             output_json = done / f"{proc.stem}.transcript.json"
