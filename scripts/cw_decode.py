@@ -5,8 +5,8 @@ This is intended for repeater ID clips and other single-tone CW IDs inside FM
 audio. It is not a full contest-grade CW skimmer. It favors robust, explainable
 DSP over a black-box model:
 
-  WAV -> mono PCM -> tone search -> Goertzel envelope -> smoothing -> adaptive
-  threshold -> timing estimate -> Morse decode -> callsign-biased candidates
+  WAV -> mono PCM -> tone search -> Goertzel envelope -> adaptive gate -> timing
+  estimate -> Morse decode -> callsign-biased candidates
 
 Examples:
   scripts/cw_decode.py clip.wav
@@ -135,14 +135,14 @@ def tone_envelope(sample_rate: int, samples: list[float], freq_hz: float, frame_
     return list(zip(times, smoothed))
 
 
-def activity_from_envelope(envelope: list[tuple[float, float]]) -> tuple[list[bool], dict[str, Any]]:
+def activity_from_envelope(envelope: list[tuple[float, float]], on_fraction: float, off_fraction: float) -> tuple[list[bool], dict[str, Any]]:
     values = [v for _, v in envelope]
     if not values:
         return [], {"threshold": 0.0}
     noise = percentile(values, 0.20)
     high = percentile(values, 0.90)
-    on_threshold = noise + (high - noise) * 0.45
-    off_threshold = noise + (high - noise) * 0.28
+    on_threshold = noise + (high - noise) * on_fraction
+    off_threshold = noise + (high - noise) * off_fraction
     active = False
     activity: list[bool] = []
     for value in values:
@@ -154,6 +154,8 @@ def activity_from_envelope(envelope: list[tuple[float, float]]) -> tuple[list[bo
     return activity, {
         "noise_floor": round(noise, 6),
         "high_level": round(high, 6),
+        "on_fraction": on_fraction,
+        "off_fraction": off_fraction,
         "on_threshold": round(on_threshold, 6),
         "off_threshold": round(off_threshold, 6),
     }
@@ -177,7 +179,7 @@ def runs_from_activity(activity: list[bool], frame_ms: int) -> list[tuple[bool, 
     duration = count * frame_ms / 1000.0
     if duration >= frame_ms / 1000.0:
         runs.append((current, duration))
-    return merge_short_runs(runs, min_duration=frame_ms / 1000.0 * 1.5)
+    return merge_short_runs(runs, min_duration=frame_ms / 1000.0 * 1.1)
 
 
 def merge_short_runs(runs: list[tuple[bool, float]], min_duration: float) -> list[tuple[bool, float]]:
@@ -217,18 +219,16 @@ def estimate_dit(runs: list[tuple[bool, float]], wpm_min: float, wpm_max: float,
     prior_wpm = (wpm_min + wpm_max) / 2.0
     prior_dit = dit_from_wpm(prior_wpm)
 
-    candidates = [d for d in on if min_dit * 0.55 <= d <= max_dit * 1.55]
+    candidates = [d for d in on if min_dit * 0.50 <= d <= max_dit * 1.50]
     if not candidates:
         candidates = on
     candidates.sort()
 
-    dot_cluster = candidates[: max(1, math.ceil(len(candidates) * 0.25))]
-    measured_dit = percentile(dot_cluster, 0.15)
-    measured_dit = max(min_dit * 0.55, min(max_dit * 1.55, measured_dit))
+    dot_cluster = candidates[: max(1, math.ceil(len(candidates) * 0.20))]
+    measured_dit = percentile(dot_cluster, 0.10)
+    measured_dit = max(min_dit * 0.50, min(max_dit * 1.50, measured_dit))
 
-    # Practice files and repeater IDs often have clean known WPM. When smoothing
-    # stretches the shortest key-down run, the WPM prior gives better spacing.
-    if use_wpm_prior and measured_dit > prior_dit * 1.25:
+    if use_wpm_prior and measured_dit > prior_dit * 1.15:
         dit = prior_dit
         source = "wpm_prior"
     else:
@@ -255,7 +255,7 @@ def decode_runs(runs: list[tuple[bool, float]], dit: float, char_gap_units: floa
     for active, duration in runs:
         units = duration / dit if dit else 0
         if active:
-            current += "." if units < 2.15 else "-"
+            current += "." if units < 2.20 else "-"
         else:
             if units >= word_gap_units:
                 if current:
@@ -299,20 +299,22 @@ def decode_wav(
     path: Path,
     low_hz: int = 300,
     high_hz: int = 2000,
-    frame_ms: int = 20,
-    smooth_frames: int = 2,
+    frame_ms: int = 10,
+    smooth_frames: int = 0,
     expected_wpm_min: float = 8.0,
     expected_wpm_max: float = 30.0,
     use_wpm_prior: bool = True,
-    char_gap_units: float = 1.75,
-    word_gap_units: float = 5.0,
+    char_gap_units: float = 2.25,
+    word_gap_units: float = 5.50,
     label_min_confidence: float = 0.72,
+    on_fraction: float = 0.55,
+    off_fraction: float = 0.45,
 ) -> dict[str, Any]:
     sample_rate, samples = read_wav_mono(path)
     duration = len(samples) / sample_rate if sample_rate else 0.0
     tone = estimate_tone(sample_rate, samples, low_hz, high_hz)
     result: dict[str, Any] = {
-        "engine": "cw_decode_dsp_v3",
+        "engine": "cw_decode_dsp_v4",
         "file": path.name,
         "sample_rate": sample_rate,
         "duration_sec": round(duration, 3),
@@ -327,14 +329,16 @@ def decode_wav(
         return result
 
     envelope = tone_envelope(sample_rate, samples, float(tone["frequency_hz"]), frame_ms, smooth_frames)
-    activity, threshold = activity_from_envelope(envelope)
+    activity, threshold = activity_from_envelope(envelope, on_fraction, off_fraction)
     runs = runs_from_activity(activity, frame_ms)
     active_time = sum(duration for active, duration in runs if active)
     total_time = sum(duration for _, duration in runs) or 1.0
     duty_cycle = active_time / total_time
 
     result["threshold"] = threshold
-    result["runs"] = [{"active": active, "duration": round(duration, 4)} for active, duration in runs[:160]]
+    result["frame_ms"] = frame_ms
+    result["smooth_frames"] = smooth_frames
+    result["runs"] = [{"active": active, "duration": round(duration, 4)} for active, duration in runs[:180]]
     result["duty_cycle"] = round(duty_cycle, 3)
     result["keyed_candidate"] = 0.02 < duty_cycle < 0.88 and len(runs) >= 5
     if not result["keyed_candidate"]:
@@ -355,7 +359,7 @@ def decode_wav(
             "label": callsign,
             "value": callsign,
             "confidence": result.get("confidence", 0.0),
-            "source": "cw_decode_dsp_v3",
+            "source": "cw_decode_dsp_v4",
         }
         for callsign in result.get("callsigns", [])
         if float(result.get("confidence", 0.0)) >= label_min_confidence
@@ -368,13 +372,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("wav", type=Path)
     parser.add_argument("--low-hz", type=int, default=300)
     parser.add_argument("--high-hz", type=int, default=2000)
-    parser.add_argument("--frame-ms", type=int, default=20)
-    parser.add_argument("--smooth-frames", type=int, default=2)
+    parser.add_argument("--frame-ms", type=int, default=10)
+    parser.add_argument("--smooth-frames", type=int, default=0)
     parser.add_argument("--expected-wpm-min", type=float, default=8.0)
     parser.add_argument("--expected-wpm-max", type=float, default=30.0)
     parser.add_argument("--no-wpm-prior", action="store_true", help="Use only measured timing; do not pull dit timing toward expected WPM")
-    parser.add_argument("--char-gap-units", type=float, default=1.75)
-    parser.add_argument("--word-gap-units", type=float, default=5.0)
+    parser.add_argument("--char-gap-units", type=float, default=2.25)
+    parser.add_argument("--word-gap-units", type=float, default=5.50)
+    parser.add_argument("--on-fraction", type=float, default=0.55)
+    parser.add_argument("--off-fraction", type=float, default=0.45)
     parser.add_argument("--label-min-confidence", type=float, default=0.72)
     parser.add_argument("--text-only", action="store_true")
     parser.add_argument("--pretty", action="store_true")
@@ -395,6 +401,8 @@ def main() -> int:
         char_gap_units=args.char_gap_units,
         word_gap_units=args.word_gap_units,
         label_min_confidence=args.label_min_confidence,
+        on_fraction=args.on_fraction,
+        off_fraction=args.off_fraction,
     )
     if args.text_only:
         print(result.get("text", ""))
