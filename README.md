@@ -30,8 +30,11 @@ The RF receiver, clip writer, transcription worker, classifier, and web page are
 - `scripts/transcribe_worker.py`  
   Watches `runtime/queue`, moves completed WAV files into `runtime/processing`, runs `faster-whisper`, optionally cleans up the rough text through LM Studio/Qwen, optionally classifies CW/tone/spoken callsign evidence, writes transcript JSON, and appends to `runtime/transcripts/index.jsonl`.
 
+- `scripts/cw_decode.py`  
+  One-shot command-line DSP Morse/CW decoder for WAV audio. It is designed for repeater ID clips and test files, and returns either text-only output or JSON evidence.
+
 - `scripts/clip_classifier.py`  
-  Optional first-pass detector for CW/Morse IDs, tone ID frequency, keyed tone candidates, and spoken callsign label candidates.
+  Optional first-pass detector for CW/Morse IDs, tone ID frequency, keyed tone candidates, and spoken callsign label candidates. It uses `cw_decode.py` internally and can also call an external CW decoder command.
 
 - `scripts/build_transcript_page.py`  
   Builds static web pages: `index.html`, `raw.html`, `processed.html`, and `classification.html`.
@@ -44,6 +47,31 @@ The RF receiver, clip writer, transcription worker, classifier, and web page are
 
 - `install.sh`  
   Installs common Debian/Ubuntu packages, creates a Python virtual environment, installs Python dependencies, and creates the runtime folder structure.
+
+## Credit and CW decoder reference
+
+This project includes a lightweight in-repo DSP Morse/CW decoder because the SDR transcription pipeline needs a toolable one-shot command:
+
+```text
+WAV file -> CW text / JSON evidence -> label_candidates -> classification_state.json
+```
+
+The CW decoder work is informed by long-standing amateur-radio digital-mode tooling. In particular, **Fldigi** by W1HKJ and contributors is a credible open-source reference for CW and other digital-mode decoding. Fldigi is not bundled here and this repository does not copy Fldigi source code; it is credited as an important reference and comparison target.
+
+Fldigi project:
+
+```text
+https://github.com/w1hkj/fldigi
+```
+
+Why keep a local decoder too?
+
+```text
+- this project needs a simple command-line WAV -> JSON/text tool
+- repeater CW IDs are usually short, single-tone, and repeated over time
+- classification_state.json can build confidence from repeated evidence
+- external decoders can still be tested with --cw-external-command
+```
 
 ## Install
 
@@ -71,7 +99,7 @@ Then run:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-mkdir -p runtime/{queue,tmp,processing,done,failed,transcripts}
+mkdir -p runtime/{queue,tmp,processing,done,failed,transcripts,test}
 ```
 
 ## Shared PPM correction
@@ -327,6 +355,177 @@ http://MSE-88:8090/processed.html
 http://MSE-88:8090/classification.html
 ```
 
+## Testing the CW decoder
+
+The CW path is intentionally command-line testable. The two key tools are:
+
+```text
+scripts/cw_decode.py        # one-shot WAV -> CW text/JSON
+scripts/clip_classifier.py  # WAV -> tone/CW/spoken-label JSON evidence
+```
+
+### Test with an ARRL Morse practice MP3
+
+Create a test folder:
+
+```bash
+cd /home/mat/SDR-audio-Transcriber
+mkdir -p runtime/test
+```
+
+Download an ARRL 20 WPM practice file:
+
+```bash
+wget -O runtime/test/arrl_20wpm.mp3 \
+  "https://www.arrl.org/files/file/Morse/Archive/20%20WPM/250107_20WPM.mp3"
+```
+
+Convert it to the WAV format expected by the decoder:
+
+```bash
+ffmpeg -y \
+  -i runtime/test/arrl_20wpm.mp3 \
+  -ac 1 \
+  -ar 48000 \
+  -sample_fmt s16 \
+  runtime/test/arrl_20wpm.wav
+```
+
+Run the CW decoder with a 20 WPM prior:
+
+```bash
+.venv/bin/python3 scripts/cw_decode.py \
+  runtime/test/arrl_20wpm.wav \
+  --low-hz 500 \
+  --high-hz 900 \
+  --expected-wpm-min 18 \
+  --expected-wpm-max 22 \
+  --text-only
+```
+
+For debug JSON:
+
+```bash
+.venv/bin/python3 scripts/cw_decode.py \
+  runtime/test/arrl_20wpm.wav \
+  --low-hz 500 \
+  --high-hz 900 \
+  --expected-wpm-min 18 \
+  --expected-wpm-max 22 \
+  --pretty | less
+```
+
+What to look for in the JSON:
+
+```text
+engine: cw_decode_dsp_v4 or newer
+tone.frequency_hz: usually around the practice tone, often near 750 Hz
+timing.dit_seconds: near 0.06 for 20 WPM
+unknown_symbols: lower is better
+confidence: higher is better
+```
+
+If the output is mostly `T` characters, the tone gate is staying active too long. Try a sharper gate:
+
+```bash
+.venv/bin/python3 scripts/cw_decode.py \
+  runtime/test/arrl_20wpm.wav \
+  --low-hz 500 \
+  --high-hz 900 \
+  --expected-wpm-min 18 \
+  --expected-wpm-max 22 \
+  --on-fraction 0.70 \
+  --off-fraction 0.60 \
+  --text-only
+```
+
+If the output has too many unknown `?` symbols, inspect the debug JSON and try a slightly different tone or timing range:
+
+```bash
+.venv/bin/python3 scripts/cw_decode.py \
+  runtime/test/arrl_20wpm.wav \
+  --low-hz 650 \
+  --high-hz 850 \
+  --expected-wpm-min 19 \
+  --expected-wpm-max 21 \
+  --pretty | less
+```
+
+### Test with a repeater-ID clip
+
+For an actual repeater clip generated by the pipeline:
+
+```bash
+.venv/bin/python3 scripts/cw_decode.py \
+  runtime/done/some_repeater_clip.wav \
+  --low-hz 300 \
+  --high-hz 2000 \
+  --expected-wpm-min 8 \
+  --expected-wpm-max 30 \
+  --pretty
+```
+
+Run the full classifier:
+
+```bash
+.venv/bin/python3 scripts/clip_classifier.py \
+  runtime/done/some_repeater_clip.wav \
+  --expected-wpm-min 8 \
+  --expected-wpm-max 30 \
+  --pretty
+```
+
+### External CW decoder hook
+
+The classifier and worker can also run an external command-line decoder. Use `{wav}` as a placeholder for the WAV file path:
+
+```bash
+.venv/bin/python3 scripts/clip_classifier.py \
+  runtime/done/some_repeater_clip.wav \
+  --cw-external-command "some-cw-decoder --input {wav}" \
+  --pretty
+```
+
+If the external decoder takes the WAV file as its last argument:
+
+```bash
+.venv/bin/python3 scripts/clip_classifier.py \
+  runtime/done/some_repeater_clip.wav \
+  --cw-external-command "some-cw-decoder" \
+  --pretty
+```
+
+Use the same hook in the long-running worker:
+
+```bash
+.venv/bin/python3 scripts/transcribe_worker.py \
+  --whisper-model small.en \
+  --device cpu \
+  --compute-type int8 \
+  --enable-classifier \
+  --cw-external-command "some-cw-decoder --input {wav}"
+```
+
+The classifier scans external decoder output for callsign-looking strings and adds them to `label_candidates` with source `external_cw_decoder`.
+
+## Classification confidence loop
+
+When `--enable-classifier` is used, each processed clip can contribute evidence such as:
+
+```text
+CW callsign candidate
+tone ID frequency
+spoken callsign candidate from Whisper/Qwen text
+```
+
+Repeated evidence is accumulated in:
+
+```text
+runtime/classification_state.json
+```
+
+This allows the system to promote a stable label over time. For example, repeated CW ID detections and repeated spoken callsigns on the same receiver/frequency can eventually promote a context label even when any single clip is uncertain.
+
 ## LM Studio cleanup model
 
 The worker uses Whisper/faster-whisper for actual audio-to-text. The configured cleanup model is used after Whisper to improve readability without inventing missing words.
@@ -371,10 +570,11 @@ runtime/
   done/                      processed WAV clips and transcript JSON
   failed/                    failed clips
   transcripts/               index.jsonl and static HTML pages
+  test/                      local test WAV/MP3 files; ignored by Git
   classification_state.json  persistent evidence state for label promotion
 ```
 
-Only `.gitkeep` placeholders are committed. Audio files, generated transcripts, and runtime classification state are ignored by Git.
+Only `.gitkeep` placeholders are committed. Audio files, generated transcripts, local test files, and runtime classification state are ignored by Git.
 
 ## GNU Radio integration notes
 
@@ -415,6 +615,18 @@ Important recorder settings:
 ```
 
 If it records too much noise, raise `--threshold`. If it misses quiet audio, lower `--threshold`. If it clips off the end of speech, raise `--hang-ms`.
+
+Important CW decoder settings:
+
+```bash
+--low-hz 300              # low end of CW tone search
+--high-hz 2000            # high end of CW tone search
+--expected-wpm-min 8      # expected slowest ID speed
+--expected-wpm-max 30     # expected fastest ID speed
+--on-fraction 0.55        # gate-open threshold fraction
+--off-fraction 0.45       # gate-close threshold fraction
+--frame-ms 10             # shorter frames track keying better
+```
 
 ## GPU transcription
 
