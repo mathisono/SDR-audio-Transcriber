@@ -21,9 +21,11 @@ def load_records(jsonl_path: Path, limit: int) -> list[dict]:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    # Keep only the latest records, but preserve chronological order so the
-    # newest transcript appears at the bottom like a live radio log.
-    return records[-limit:]
+    # Preserve chronological order so the newest transcript appears at the
+    # bottom like a live radio log. limit=0 means show the full JSONL history.
+    if limit and limit > 0:
+        return records[-limit:]
+    return records
 
 
 def esc(value: object) -> str:
@@ -257,9 +259,10 @@ def page_shell(title: str, subtitle: str, active: str, counts: dict[str, int], b
 """
 
 
-def build_pages(records: list[dict], title: str) -> dict[str, str]:
+def build_pages(records: list[dict], title: str, limit: int, total_records: int) -> dict[str, str]:
     processed_records = [record for record in records if is_post_processed(record)]
     classified_records = [record for record in records if has_classification(record)]
+    limit_note = "full log" if not limit or limit <= 0 else f"latest {len(records)} of {total_records} records"
     counts = {
         "raw": len(records),
         "processed": len(processed_records),
@@ -275,7 +278,8 @@ def build_pages(records: list[dict], title: str) -> dict[str, str]:
     <section>
       <h2 class="section-title">Status</h2>
       <article class="card">
-        <p>Newest records appear at the bottom of each log page. Use the pages above instead of scrolling through one combined view.</p>
+        <p>Newest records appear at the bottom of each log page. Current build is showing: {esc(limit_note)}.</p>
+        <p class="muted">These pages are generated from runtime/transcripts/index.jsonl, not by reading WAV files directly.</p>
       </article>
     </section>
     """
@@ -302,17 +306,17 @@ def build_pages(records: list[dict], title: str) -> dict[str, str]:
     """
 
     return {
-        "index.html": page_shell(title, "Dashboard for SDR audio transcription views.", "dashboard", counts, dashboard_body),
-        "raw.html": page_shell("Raw Whisper Log", f"Showing latest {len(records)} raw clips, oldest at top and newest at bottom.", "raw", counts, raw_body),
-        "processed.html": page_shell("Post-Processed Log", f"Showing latest {len(processed_records)} Qwen/LM Studio processed clips, oldest at top and newest at bottom.", "processed", counts, processed_body),
-        "classification.html": page_shell("Classification / Labels", f"Showing latest {len(classified_records)} classified clips, oldest at top and newest at bottom.", "classification", counts, classification_body),
+        "index.html": page_shell(title, f"Dashboard for SDR audio transcription views; showing {limit_note}.", "dashboard", counts, dashboard_body),
+        "raw.html": page_shell("Raw Whisper Log", f"Showing {limit_note}, oldest at top and newest at bottom.", "raw", counts, raw_body),
+        "processed.html": page_shell("Post-Processed Log", f"Showing {len(processed_records)} Qwen/LM Studio processed clips from {limit_note}, oldest at top and newest at bottom.", "processed", counts, processed_body),
+        "classification.html": page_shell("Classification / Labels", f"Showing {len(classified_records)} classified clips from {limit_note}, oldest at top and newest at bottom.", "classification", counts, classification_body),
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build transcript HTML pages from JSONL log")
     parser.add_argument("--transcripts", default="runtime/transcripts")
-    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--limit", type=int, default=2000, help="Maximum records to render. Use 0 for all records.")
     parser.add_argument("--title", default="SDR Audio Transcripts")
     args = parser.parse_args()
 
@@ -320,12 +324,14 @@ def main() -> int:
     transcript_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = transcript_dir / "index.jsonl"
 
-    records = load_records(jsonl_path, args.limit)
-    pages = build_pages(records, args.title)
+    all_records = load_records(jsonl_path, 0)
+    records = all_records if args.limit <= 0 else all_records[-args.limit:]
+    pages = build_pages(records, args.title, args.limit, len(all_records))
     for filename, content in pages.items():
         path = transcript_dir / filename
         path.write_text(content, encoding="utf-8")
         print(f"wrote {path}")
+    print(f"rendered {len(records)} of {len(all_records)} records (limit={args.limit})")
     return 0
 
 
