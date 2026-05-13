@@ -30,8 +30,7 @@ def parse_time(value: object) -> datetime:
 
 def sort_key(record: dict) -> tuple[datetime, datetime, int]:
     # Clip start time is the best radio timeline. If missing, fall back to the
-    # worker-created time, then JSONL record number. This makes every page read
-    # oldest -> newest, so scrolling up goes back in time.
+    # worker-created time, then JSONL record number.
     return (
         parse_time(record.get("started_utc") or record.get("created_utc")),
         parse_time(record.get("created_utc") or record.get("started_utc")),
@@ -54,7 +53,13 @@ def load_records(jsonl_path: Path) -> list[dict]:
                 records.append(record)
             except json.JSONDecodeError:
                 continue
+    # Keep the source order normalized oldest -> newest here. Page rendering
+    # reverses this so the visible log is newest first.
     return sorted(records, key=sort_key)
+
+
+def newest_first(records: list[dict]) -> list[dict]:
+    return list(reversed(records))
 
 
 def esc(value: object) -> str:
@@ -198,18 +203,18 @@ def render_cards(records: list[dict], text_key: str, include_compare: bool = Fal
     return "".join(cards)
 
 
-def timeline_summary(records: list[dict], total_records: int, generated_utc: str) -> str:
-    first = clip_time(records[0]) if records else "none"
-    latest = clip_time(records[-1]) if records else "none"
-    latest_no = records[-1].get("_record_number") if records else "none"
+def timeline_summary(records: list[dict], total_records: int, generated_utc: str, page_label: str) -> str:
+    newest = clip_time(records[-1]) if records else "none"
+    oldest = clip_time(records[0]) if records else "none"
+    newest_no = records[-1].get("_record_number") if records else "none"
     return f"""
     <article class="card status-card">
-      <div><strong>Rendered records:</strong> {len(records)} of {total_records}</div>
-      <div><strong>Oldest rendered:</strong> {esc(first)}</div>
-      <div><strong>Newest rendered:</strong> {esc(latest)} <span class="pill">record #{esc(latest_no)}</span></div>
-      <div><strong>Sort order:</strong> oldest at top → newest at bottom. Scroll up to go back in time.</div>
+      <div><strong>{esc(page_label)} records:</strong> {len(records)} of {total_records}</div>
+      <div><strong>Newest rendered:</strong> {esc(newest)} <span class="pill">record #{esc(newest_no)}</span></div>
+      <div><strong>Oldest rendered:</strong> {esc(oldest)}</div>
+      <div><strong>Sort order:</strong> newest at top → older below. Scroll down to go back in time.</div>
       <div><strong>Page generated:</strong> {esc(generated_utc)}</div>
-      <div class="muted">Raw Whisper Log is generated from <code>runtime/transcripts/index.jsonl</code>, not by reading WAV files directly.</div>
+      <div class="muted">Pages are generated from <code>runtime/transcripts/index.jsonl</code>, not by reading WAV files directly.</div>
     </article>
     """
 
@@ -282,13 +287,6 @@ def stylesheet() -> str:
     details { margin-top: .75rem; }
     summary { cursor: pointer; color: #c9d4e5; }
     .error { color: #ffb4b4; }
-    .floating-bottom {
-      position: fixed;
-      right: 1rem;
-      bottom: 1rem;
-      z-index: 5;
-      box-shadow: 0 8px 24px rgba(0,0,0,.35);
-    }
     """
 
 
@@ -334,6 +332,11 @@ def page_shell(title: str, subtitle: str, active: str, counts: dict[str, int], b
 def build_pages(records: list[dict], title: str, limit: int, total_records: int, generated_utc: str) -> dict[str, str]:
     processed_records = [record for record in records if is_post_processed(record)]
     classified_records = [record for record in records if has_classification(record)]
+
+    records_desc = newest_first(records)
+    processed_desc = newest_first(processed_records)
+    classified_desc = newest_first(classified_records)
+
     limit_note = "full log" if not limit or limit <= 0 else f"latest {len(records)} of {total_records} records"
     counts = {
         "raw": len(records),
@@ -343,48 +346,54 @@ def build_pages(records: list[dict], title: str, limit: int, total_records: int,
 
     dashboard_body = f"""
     <section class="grid">
-      <a class="summary-card" href="raw.html"><strong>Raw Whisper Log</strong><span class="subtle">{len(records)} clips. Direct ASR output.</span></a>
+      <a class="summary-card" href="raw.html"><strong>Raw Whisper Log</strong><span class="subtle">{len(records)} clips. Raw ASR output only.</span></a>
       <a class="summary-card" href="processed.html"><strong>Post-Processed Log</strong><span class="subtle">{len(processed_records)} clips. Qwen/LM Studio cleanup output.</span></a>
       <a class="summary-card" href="classification.html"><strong>Classification / Labels</strong><span class="subtle">{len(classified_records)} clips. CW, tone ID, spoken callsign, and stable label evidence.</span></a>
     </section>
     <section>
       <h2 class="section-title">Status</h2>
-      {timeline_summary(records, total_records, generated_utc)}
+      {timeline_summary(records, total_records, generated_utc, "All")}
     </section>
     """
 
     raw_body = f"""
     <section>
       <h2 class="section-title">Timeline</h2>
-      {timeline_summary(records, total_records, generated_utc)}
-      <a class="tab floating-bottom" href="#latest-record">Jump to latest</a>
+      {timeline_summary(records, total_records, generated_utc, "Raw")}
     </section>
     <section>
       <h2 class="section-title">Raw Whisper Log</h2>
-      {render_cards(records, text_key="raw_text", include_compare=False, include_labels=True, compact_raw=True)}
-      <div id="latest-record"></div>
+      {render_cards(records_desc, text_key="raw_text", include_compare=False, include_labels=False, compact_raw=True)}
     </section>
     """
 
     processed_body = f"""
     <section>
+      <h2 class="section-title">Timeline</h2>
+      {timeline_summary(processed_records, len(processed_records), generated_utc, "Post-processed")}
+    </section>
+    <section>
       <h2 class="section-title">Post-Processed Log</h2>
-      {render_cards(processed_records, text_key="text", include_compare=True, include_labels=True)}
+      {render_cards(processed_desc, text_key="text", include_compare=True, include_labels=False)}
     </section>
     """
 
     classification_body = f"""
     <section>
+      <h2 class="section-title">Timeline</h2>
+      {timeline_summary(classified_records, len(classified_records), generated_utc, "Classified")}
+    </section>
+    <section>
       <h2 class="section-title">Classification / Labels</h2>
-      {render_cards(classified_records, text_key="raw_text", include_compare=False, include_labels=True)}
+      {render_cards(classified_desc, text_key="raw_text", include_compare=False, include_labels=True)}
     </section>
     """
 
     return {
         "index.html": page_shell(title, f"Dashboard for SDR audio transcription views; showing {limit_note}.", "dashboard", counts, dashboard_body),
-        "raw.html": page_shell("Raw Whisper Log", f"Showing {limit_note}, oldest at top and newest at bottom. Scroll up to go back in time.", "raw", counts, raw_body),
-        "processed.html": page_shell("Post-Processed Log", f"Showing {len(processed_records)} Qwen/LM Studio processed clips from {limit_note}, oldest at top and newest at bottom.", "processed", counts, processed_body),
-        "classification.html": page_shell("Classification / Labels", f"Showing {len(classified_records)} classified clips from {limit_note}, oldest at top and newest at bottom.", "classification", counts, classification_body),
+        "raw.html": page_shell("Raw Whisper Log", f"Showing raw ASR only from {limit_note}, newest at top and older below.", "raw", counts, raw_body),
+        "processed.html": page_shell("Post-Processed Log", f"Showing {len(processed_records)} Qwen/LM Studio processed clips, newest at top and older below.", "processed", counts, processed_body),
+        "classification.html": page_shell("Classification / Labels", f"Showing {len(classified_records)} classified clips, newest at top and older below.", "classification", counts, classification_body),
     }
 
 
@@ -407,7 +416,7 @@ def main() -> int:
         path = transcript_dir / filename
         path.write_text(content, encoding="utf-8")
         print(f"wrote {path}")
-    print(f"rendered {len(records)} of {len(all_records)} records (limit={args.limit}) generated={generated_utc}")
+    print(f"rendered {len(records)} of {len(all_records)} records (limit={args.limit}) generated={generated_utc}; visible order=newest-first")
     return 0
 
 
