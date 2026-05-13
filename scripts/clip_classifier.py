@@ -6,6 +6,10 @@ prominent audio tone frequency, looks for keyed CW-like on/off timing around tha
 tone, attempts a basic Morse decode, and returns JSON evidence that can be used
 to populate label candidates.
 
+It can also run an optional external command-line CW decoder. The external
+command receives the WAV path either by replacing {wav} in the command string or
+by appending the WAV path as the final argument.
+
 The output is evidence, not a final truth. Repeated evidence over time should be
 used by the UI/refinement loop to promote stable labels.
 """
@@ -15,7 +19,9 @@ import argparse
 import json
 import math
 import re
+import shlex
 import statistics
+import subprocess
 import wave
 from pathlib import Path
 from typing import Any
@@ -75,20 +81,17 @@ def goertzel_power(samples: list[float], sample_rate: int, freq_hz: float) -> fl
 
 
 def estimate_dominant_tone(sample_rate: int, samples: list[float], low_hz: int, high_hz: int) -> dict[str, Any]:
-    # Analyze up to the first 12 seconds for speed.
     max_samples = min(len(samples), sample_rate * 12)
     window = samples[:max_samples]
     if len(window) < sample_rate // 2:
         return {"detected": False, "reason": "clip too short"}
 
-    # Coarse scan. Repeater CW IDs are commonly around the audio tone range.
     candidates = list(range(low_hz, high_hz + 1, 25))
     powers = [(freq, goertzel_power(window, sample_rate, freq)) for freq in candidates]
     powers.sort(key=lambda item: item[1], reverse=True)
     best_freq, best_power = powers[0]
     median_power = statistics.median([p for _, p in powers]) or 1.0
 
-    # Refine around the best bin.
     refine = list(range(max(low_hz, best_freq - 30), min(high_hz, best_freq + 30) + 1, 5))
     refined = [(freq, goertzel_power(window, sample_rate, freq)) for freq in refine]
     refined.sort(key=lambda item: item[1], reverse=True)
@@ -148,7 +151,6 @@ def estimate_dit(on_durations: list[float]) -> float | None:
     if not short:
         return None
     short.sort()
-    # Use a low percentile so dashes do not dominate.
     return short[max(0, min(len(short) - 1, int(len(short) * 0.25)))]
 
 
@@ -175,7 +177,6 @@ def decode_morse_from_runs(runs: list[tuple[bool, float]]) -> dict[str, Any]:
                     symbols.append(current)
                     current = ""
             else:
-                # Intra-character gap.
                 pass
     if current:
         symbols.append(current)
@@ -197,9 +198,54 @@ def decode_morse_from_runs(runs: list[tuple[bool, float]]) -> dict[str, Any]:
     }
 
 
-def classify_wav(path: Path, low_hz: int, high_hz: int, frame_ms: int) -> dict[str, Any]:
+def extract_callsigns(text: str) -> list[str]:
+    return sorted(set(match.group(0).upper() for match in CALLSIGN_RE.finditer(text or "")))
+
+
+def run_external_cw_decoder(path: Path, command: str, timeout: int) -> dict[str, Any]:
+    if not command:
+        return {"enabled": False}
+
+    if "{wav}" in command:
+        args = shlex.split(command.replace("{wav}", str(path)))
+    else:
+        args = shlex.split(command) + [str(path)]
+
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+    except Exception as exc:
+        return {"enabled": True, "command": command, "error": str(exc), "label_candidates": []}
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    callsigns = extract_callsigns(stdout)
+    confidence = 0.72 if callsigns else 0.25 if stdout else 0.0
+    return {
+        "enabled": True,
+        "command": command,
+        "argv": args,
+        "returncode": proc.returncode,
+        "stdout": stdout[-4000:],
+        "stderr": stderr[-1000:],
+        "callsigns": callsigns,
+        "confidence": confidence,
+        "label_candidates": [
+            {
+                "type": "cw_callsign",
+                "label": callsign,
+                "value": callsign,
+                "confidence": confidence,
+                "source": "external_cw_decoder",
+            }
+            for callsign in callsigns
+        ],
+    }
+
+
+def classify_wav(path: Path, low_hz: int, high_hz: int, frame_ms: int, external_command: str = "", external_timeout: int = 20) -> dict[str, Any]:
     sample_rate, samples = read_wav_mono(path)
     tone = estimate_dominant_tone(sample_rate, samples, low_hz, high_hz)
+    external = run_external_cw_decoder(path, external_command, external_timeout)
     result: dict[str, Any] = {
         "enabled": True,
         "engine": "clip_classifier_v1",
@@ -208,7 +254,8 @@ def classify_wav(path: Path, low_hz: int, high_hz: int, frame_ms: int) -> dict[s
         "duration_sec": round(len(samples) / sample_rate, 3) if sample_rate else 0,
         "tone_id": tone,
         "cw_id": {"decoded": False, "reason": "tone not detected"},
-        "label_candidates": [],
+        "external_cw_decoder": external,
+        "label_candidates": list(external.get("label_candidates", [])),
     }
 
     if tone.get("detected") and tone.get("frequency_hz"):
@@ -250,13 +297,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--low-hz", type=int, default=300)
     parser.add_argument("--high-hz", type=int, default=2000)
     parser.add_argument("--frame-ms", type=int, default=20)
+    parser.add_argument("--cw-external-command", default="", help="Optional external CW decoder command. Use {wav} placeholder or WAV path is appended.")
+    parser.add_argument("--cw-external-timeout", type=int, default=20)
     parser.add_argument("--pretty", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    result = classify_wav(args.wav, args.low_hz, args.high_hz, args.frame_ms)
+    result = classify_wav(
+        args.wav,
+        args.low_hz,
+        args.high_hz,
+        args.frame_ms,
+        external_command=args.cw_external_command,
+        external_timeout=args.cw_external_timeout,
+    )
     print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=True))
     return 0
 
