@@ -1,0 +1,3 @@
+# Build constraints for MSE-88 / Python 3.8.
+# PyAV 10 fails with newer Cython during isolated builds.
+Cython==0.29.37
