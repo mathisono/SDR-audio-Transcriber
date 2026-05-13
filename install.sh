@@ -57,7 +57,8 @@ chmod +x \
   "${ROOT_DIR}/scripts/clip_writer.py" \
   "${ROOT_DIR}/scripts/transcribe_worker.py" \
   "${ROOT_DIR}/scripts/build_transcript_page.py" \
-  "${ROOT_DIR}/scripts/audio_fft_ppm_finder_terminal.py"
+  "${ROOT_DIR}/scripts/audio_fft_ppm_finder_terminal.py" \
+  "${ROOT_DIR}/scripts/ppm_config.py"
 
 cat > "${ROOT_DIR}/runtime/transcripts/index.html" <<'HTML'
 <!doctype html>
@@ -74,8 +75,15 @@ Install complete.
 Activate the venv:
   source .venv/bin/activate
 
-Start a first WBFM recorder test:
-  rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 -p 135 - | \\
+Show the shared SDR source PPM correction:
+  python3 scripts/ppm_config.py show
+
+Set the shared SDR source PPM correction once:
+  python3 scripts/ppm_config.py set 135
+
+Start a first WBFM recorder test using the configured PPM value:
+  PPM_ARGS="\$(python3 scripts/ppm_config.py rtl-fm-args)"
+  rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 \${PPM_ARGS} - | \\
     python3 scripts/clip_writer.py --source MSE-88 --frequency 90700000 --receiver receiver1
 
 Start the transcription worker without LM Studio cleanup:
