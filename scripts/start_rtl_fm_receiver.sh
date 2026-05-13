@@ -4,6 +4,7 @@ set -euo pipefail
 CONFIG="configs/shared_baseband_radio_server.json"
 RECEIVER="rx-1"
 SOURCE="MSE-88"
+FREQUENCY_OVERRIDE=""
 GAIN=""
 THRESHOLD=""
 VERBOSE=""
@@ -12,25 +13,27 @@ usage() {
   cat <<'EOF'
 Usage: scripts/start_rtl_fm_receiver.sh [options]
 
-Starts rtl_fm and clip_writer with the same active receiver frequency read from
-configs/shared_baseband_radio_server.json. This keeps WAV filenames and JSON
-metadata matched to the actual tuned receiver frequency.
+Starts rtl_fm and clip_writer with the same active receiver frequency. By default
+it reads receivers[].frequency_hz from configs/shared_baseband_radio_server.json.
+You can also pass --frequency 442.275M for one-off/live tuning. Either way, the
+same frequency is used for rtl_fm -f and clip_writer metadata/file names.
 
 Options:
-  --config PATH       Config JSON path. Default: configs/shared_baseband_radio_server.json
-  --receiver ID       Receiver id/name from config. Default: rx-1
-  --source NAME       Source label for metadata. Default: MSE-88
-  --gain DB           Override SDR gain. Default: source.gain_db from config
-  --threshold RMS     Override clip_writer RMS threshold. Default: clip_writer.squelch_threshold_rms
-  --verbose           Pass --verbose to clip_writer
-  -h, --help          Show this help
+  --config PATH        Config JSON path. Default: configs/shared_baseband_radio_server.json
+  --receiver ID        Receiver id/name from config. Default: rx-1
+  --frequency FREQ     Override tuned frequency for this run, e.g. 442.275M or 442275000
+  --source NAME        Source label for metadata. Default: MSE-88
+  --gain DB            Override SDR gain. Default: source.gain_db from config
+  --threshold RMS      Override clip_writer RMS threshold. Default: clip_writer.squelch_threshold_rms
+  --verbose            Pass --verbose to clip_writer
+  -h, --help           Show this help
 
 Examples:
   scripts/start_rtl_fm_receiver.sh --receiver rx-1
-  scripts/start_rtl_fm_receiver.sh --receiver rx-1 --threshold 450 --verbose
+  scripts/start_rtl_fm_receiver.sh --receiver rx-1 --frequency 442.275M --threshold 450 --verbose
 
-Change the active receiver frequency first:
-  .venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-frequency 441.000M
+Persist the active receiver frequency in config:
+  .venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-frequency 442.275M
 EOF
 }
 
@@ -38,6 +41,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG="$2"; shift 2 ;;
     --receiver) RECEIVER="$2"; shift 2 ;;
+    --frequency) FREQUENCY_OVERRIDE="$2"; shift 2 ;;
     --source) SOURCE="$2"; shift 2 ;;
     --gain) GAIN="$2"; shift 2 ;;
     --threshold) THRESHOLD="$2"; shift 2 ;;
@@ -55,10 +59,6 @@ if [[ ! -x "${PY}" ]]; then
   PY="python3"
 fi
 
-FREQ_HZ="$(${PY} scripts/receiver_config.py --config "${CONFIG}" --receiver "${RECEIVER}" frequency-hz)"
-RTL_FREQ="$(${PY} scripts/receiver_config.py --config "${CONFIG}" --receiver "${RECEIVER}" rtl-fm-frequency)"
-PPM_ARGS="$(${PY} scripts/ppm_config.py --config "${CONFIG}" rtl-fm-args)"
-
 read_config_value() {
   local expr="$1"
   ${PY} - "$CONFIG" "$expr" <<'PY'
@@ -72,7 +72,67 @@ print(cur)
 PY
 }
 
-MODE="$(read_config_value "receivers.0.mode" 2>/dev/null || echo wbfm)"
+receiver_value() {
+  local key="$1"
+  ${PY} - "$CONFIG" "$RECEIVER" "$key" <<'PY'
+import json, sys
+path, receiver_id, key = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(path))
+for rx in data.get('receivers', []):
+    if receiver_id in {str(rx.get('id', '')), str(rx.get('name', ''))}:
+        print(rx.get(key, ''))
+        raise SystemExit(0)
+raise SystemExit(f'receiver not found: {receiver_id}')
+PY
+}
+
+parse_frequency_hz() {
+  local freq="$1"
+  ${PY} - "$freq" <<'PY'
+import sys
+text = sys.argv[1].strip().lower().replace('hz', '')
+mult = 1
+if text.endswith('mhz'):
+    text = text[:-3]
+    mult = 1_000_000
+elif text.endswith('m'):
+    text = text[:-1]
+    mult = 1_000_000
+elif text.endswith('khz'):
+    text = text[:-3]
+    mult = 1_000
+elif text.endswith('k'):
+    text = text[:-1]
+    mult = 1_000
+print(int(round(float(text) * mult)))
+PY
+}
+
+format_rtl_frequency() {
+  local freq_hz="$1"
+  ${PY} - "$freq_hz" <<'PY'
+import sys
+freq = int(sys.argv[1])
+if freq >= 1_000_000:
+    print(f"{freq / 1_000_000.0:.6f}M")
+elif freq >= 1_000:
+    print(f"{freq / 1_000.0:.3f}k")
+else:
+    print(str(freq))
+PY
+}
+
+if [[ -n "${FREQUENCY_OVERRIDE}" ]]; then
+  FREQ_HZ="$(parse_frequency_hz "${FREQUENCY_OVERRIDE}")"
+  RTL_FREQ="$(format_rtl_frequency "${FREQ_HZ}")"
+else
+  FREQ_HZ="$(${PY} scripts/receiver_config.py --config "${CONFIG}" --receiver "${RECEIVER}" frequency-hz)"
+  RTL_FREQ="$(${PY} scripts/receiver_config.py --config "${CONFIG}" --receiver "${RECEIVER}" rtl-fm-frequency)"
+fi
+
+PPM_ARGS="$(${PY} scripts/ppm_config.py --config "${CONFIG}" rtl-fm-args)"
+
+MODE="$(receiver_value "mode" 2>/dev/null || echo wbfm)"
 SAMPLE_RATE="$(read_config_value "source.sample_rate" 2>/dev/null || echo 240000)"
 AUDIO_RATE="$(read_config_value "audio.sample_rate" 2>/dev/null || echo 48000)"
 HANG_MS="$(read_config_value "clip_writer.hang_time_ms" 2>/dev/null || echo 1200)"
