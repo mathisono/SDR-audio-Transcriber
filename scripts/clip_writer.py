@@ -14,6 +14,7 @@ import argparse
 import audioop
 import json
 import os
+import re
 import time
 import wave
 from datetime import datetime, timezone
@@ -23,11 +24,30 @@ CHUNK_MS = 100
 
 
 def utc_stamp_for_filename() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%SZ")
+    # Include milliseconds so multiple receivers opening in the same second do
+    # not collide. Keep the format sortable by time.
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%d_%H%M%S") + f".{int(now.microsecond / 1000):03d}Z"
 
 
 def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def safe_token(value: object) -> str:
+    text = str(value).strip().replace(" ", "_")
+    text = re.sub(r"[^A-Za-z0-9_.+-]+", "_", text)
+    return text.strip("_") or "unknown"
+
+
+def frequency_label(frequency_hz: int) -> str:
+    if frequency_hz >= 1_000_000:
+        mhz = frequency_hz / 1_000_000.0
+        return f"{mhz:.6f}MHz"
+    if frequency_hz >= 1_000:
+        khz = frequency_hz / 1_000.0
+        return f"{khz:.3f}kHz"
+    return f"{frequency_hz}Hz"
 
 
 def open_wav(path: Path, sample_rate: int) -> wave.Wave_write:
@@ -51,7 +71,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--receiver", default="receiver1", help="Receiver ID/name for filenames")
     parser.add_argument("--source", default="unknown", help="Source hostname or SDR label")
     parser.add_argument("--mode", default="wbfm", help="Receiver mode metadata")
-    parser.add_argument("--frequency", type=int, default=90700000, help="Tuned frequency in Hz")
+    parser.add_argument("--frequency", type=int, default=None, help="Active tuned receiver frequency in Hz")
+    parser.add_argument("--frequency-hz", type=int, default=None, help="Active tuned receiver frequency in Hz")
+    parser.add_argument("--frequency-mhz", type=float, default=None, help="Active tuned receiver frequency in MHz, for example 441.000")
     parser.add_argument("--sample-rate", type=int, default=48000, help="PCM sample rate in Hz")
     parser.add_argument("--threshold", type=int, default=650, help="RMS threshold that opens squelch")
     parser.add_argument("--hang-ms", type=int, default=1200, help="Audio hang time after RMS drops")
@@ -61,8 +83,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_frequency_hz(args: argparse.Namespace) -> int:
+    if args.frequency_mhz is not None:
+        return int(round(args.frequency_mhz * 1_000_000))
+    if args.frequency_hz is not None:
+        return int(args.frequency_hz)
+    if args.frequency is not None:
+        return int(args.frequency)
+    # Preserve old behavior for compatibility, but make startup output explicit.
+    return 90700000
+
+
 def main() -> int:
     args = parse_args()
+    active_frequency_hz = resolve_frequency_hz(args)
+    active_frequency_label = frequency_label(active_frequency_hz)
 
     queue_dir = Path(args.queue)
     tmp_dir = Path(args.tmp)
@@ -82,7 +117,12 @@ def main() -> int:
     frames_written = 0
     last_verbose = 0.0
 
-    print("clip_writer: waiting for mono s16le PCM on stdin", flush=True)
+    print(
+        "clip_writer: waiting for mono s16le PCM on stdin "
+        f"source={args.source} receiver={args.receiver} "
+        f"frequency_hz={active_frequency_hz} frequency={active_frequency_label}",
+        flush=True,
+    )
 
     while True:
         data = os.read(0, bytes_per_chunk)
@@ -106,8 +146,13 @@ def main() -> int:
         if active and not recording:
             stamp = utc_stamp_for_filename()
             started_utc = utc_iso()
-            safe_receiver = args.receiver.replace(" ", "_")
-            base = f"{stamp}_{args.frequency}Hz_{safe_receiver}"
+            safe_source = safe_token(args.source)
+            safe_receiver = safe_token(args.receiver)
+            safe_mode = safe_token(args.mode)
+            safe_freq = safe_token(active_frequency_label)
+            # Filename format is sortable and works when many receivers are running:
+            # time__source__receiver__frequency__mode__pid.wav
+            base = f"{stamp}__{safe_source}__{safe_receiver}__{safe_freq}__{safe_mode}__pid{os.getpid()}"
             tmp_wav = tmp_dir / f"{base}.wav.part"
             tmp_json = tmp_dir / f"{base}.json.part"
             final_wav = queue_dir / f"{base}.wav"
@@ -143,13 +188,15 @@ def main() -> int:
             metadata = {
                 "receiver": args.receiver,
                 "source": args.source,
-                "frequency_hz": args.frequency,
+                "frequency_hz": active_frequency_hz,
+                "frequency_label": active_frequency_label,
                 "mode": args.mode,
                 "sample_rate": args.sample_rate,
                 "started_utc": started_utc,
                 "duration_sec": round(duration, 3),
                 "squelch_threshold_rms": args.threshold,
                 "hang_time_ms": args.hang_ms,
+                "writer_pid": os.getpid(),
             }
             if tmp_json and final_json:
                 write_sidecar(tmp_json, metadata)
