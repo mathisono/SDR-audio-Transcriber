@@ -30,43 +30,72 @@ def esc(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
-def build_page(records: list[dict], title: str) -> str:
-    cards: list[str] = []
-    for record in records:
-        created = esc(record.get("created_utc", ""))
-        filename = esc(record.get("file", ""))
-        receiver = esc(record.get("receiver", ""))
-        frequency = esc(record.get("frequency_hz", ""))
-        duration = esc(record.get("duration_sec", record.get("duration", "")))
-        text = esc(record.get("text", ""))
-        raw_text = esc(record.get("raw_text", ""))
-        error = esc(record.get("error", ""))
+def is_post_processed(record: dict) -> bool:
+    raw = (record.get("raw_text") or "").strip()
+    text = (record.get("text") or "").strip()
+    cleanup_model = record.get("cleanup_model")
+    cleanup_error = record.get("cleanup_error")
+    return bool(cleanup_model and not cleanup_error and text and text != raw)
 
-        error_block = f'<p class="error">{error}</p>' if error else ""
-        raw_block = ""
-        if raw_text and raw_text != text:
-            raw_block = f"""
-            <details>
-              <summary>Raw transcript</summary>
-              <pre>{raw_text}</pre>
-            </details>
-            """
 
-        cards.append(f"""
-        <article class="card">
-          <div class="meta">
-            <strong>{created}</strong><br>
-            <span>{filename}</span><br>
-            <span>receiver={receiver} frequency={frequency}Hz duration={duration}s</span>
-          </div>
-          {error_block}
-          <p>{text}</p>
-          {raw_block}
-        </article>
-        """)
+def render_card(record: dict, text_key: str, include_compare: bool = False) -> str:
+    created = esc(record.get("created_utc", ""))
+    filename = esc(record.get("file", ""))
+    receiver = esc(record.get("receiver", ""))
+    frequency = esc(record.get("frequency_hz", ""))
+    duration = esc(record.get("duration_sec", record.get("duration", "")))
+    raw_text = esc(record.get("raw_text", ""))
+    text = esc(record.get(text_key, ""))
+    error = esc(record.get("error", ""))
+    cleanup_model = esc(record.get("cleanup_model", ""))
+    cleanup_endpoint = esc(record.get("cleanup_endpoint", ""))
+    cleanup_error = esc(record.get("cleanup_error", ""))
 
+    status_bits: list[str] = []
+    if cleanup_model:
+        status_bits.append(f"cleanup_model={cleanup_model}")
+    if cleanup_endpoint:
+        status_bits.append(f"endpoint={cleanup_endpoint}")
+    status_line = "<br>" + esc(" ".join(status_bits)) if status_bits else ""
+
+    error_block = f'<p class="error">{error}</p>' if error else ""
+    cleanup_error_block = f'<p class="error">cleanup_error={cleanup_error}</p>' if cleanup_error else ""
+
+    compare_block = ""
+    if include_compare and raw_text and raw_text != text:
+        compare_block = f"""
+        <details>
+          <summary>Show raw Whisper transcript</summary>
+          <pre>{raw_text}</pre>
+        </details>
+        """
+
+    return f"""
+    <article class="card">
+      <div class="meta">
+        <strong>{created}</strong><br>
+        <span>{filename}</span><br>
+        <span>receiver={receiver} frequency={frequency}Hz duration={duration}s</span>{status_line}
+      </div>
+      {error_block}
+      {cleanup_error_block}
+      <p>{text}</p>
+      {compare_block}
+    </article>
+    """
+
+
+def render_cards(records: list[dict], text_key: str, include_compare: bool = False) -> str:
+    cards = [render_card(record, text_key=text_key, include_compare=include_compare) for record in records]
     if not cards:
         cards.append('<article class="card"><p>No transcripts yet.</p></article>')
+    return "".join(cards)
+
+
+def build_page(records: list[dict], title: str) -> str:
+    processed_records = [record for record in records if is_post_processed(record)]
+    raw_cards = render_cards(records, text_key="raw_text", include_compare=False)
+    processed_cards = render_cards(processed_records, text_key="text", include_compare=True)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -89,6 +118,29 @@ def build_page(records: list[dict], title: str) -> str:
     header {{ margin-bottom: 1.5rem; }}
     h1 {{ margin: 0 0 .25rem; font-size: 1.9rem; }}
     .subtle {{ color: #a8a8a8; }}
+    .tabs {{
+      display: flex;
+      gap: .5rem;
+      flex-wrap: wrap;
+      margin: 1rem 0 1.5rem;
+      border-bottom: 1px solid #333842;
+      padding-bottom: .75rem;
+    }}
+    .tab {{
+      display: inline-block;
+      text-decoration: none;
+      color: #e6edf7;
+      background: #252933;
+      border: 1px solid #3a4050;
+      border-radius: 999px;
+      padding: .55rem .9rem;
+      font-size: .95rem;
+    }}
+    .tab:hover {{ background: #303747; }}
+    .section-title {{
+      margin: 1.5rem 0 .5rem;
+      font-size: 1.35rem;
+    }}
     .card {{
       background: #1b1d22;
       border: 1px solid #333842;
@@ -109,9 +161,23 @@ def build_page(records: list[dict], title: str) -> str:
 <body>
   <header>
     <h1>{esc(title)}</h1>
-    <div class="subtle">Showing latest {len(records)} clips, oldest at top and newest at bottom. Auto-refreshes every 20 seconds.</div>
+    <div class="subtle">Showing latest {len(records)} raw clips and {len(processed_records)} post-processed clips, oldest at top and newest at bottom. Auto-refreshes every 20 seconds.</div>
+    <nav class="tabs" aria-label="Transcript views">
+      <a class="tab" href="#raw-log">Raw Whisper Log ({len(records)})</a>
+      <a class="tab" href="#post-processed-log">Post-Processed Log ({len(processed_records)})</a>
+    </nav>
   </header>
-  {''.join(cards)}
+
+  <section id="raw-log">
+    <h2 class="section-title">Raw Whisper Log</h2>
+    {raw_cards}
+  </section>
+
+  <section id="post-processed-log">
+    <h2 class="section-title">Post-Processed Log</h2>
+    {processed_cards}
+  </section>
+
   <div id="bottom" class="bottom-anchor"></div>
 </body>
 </html>
