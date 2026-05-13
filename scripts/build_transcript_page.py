@@ -38,7 +38,53 @@ def is_post_processed(record: dict) -> bool:
     return bool(cleanup_model and not cleanup_error and text and text != raw)
 
 
-def render_card(record: dict, text_key: str, include_compare: bool = False) -> str:
+def has_classification(record: dict) -> bool:
+    classification = record.get("classification") or {}
+    return bool(record.get("label_candidates") or classification.get("tone_id") or classification.get("cw_id"))
+
+
+def render_label_block(record: dict) -> str:
+    label = record.get("label") or {}
+    label_text = label.get("label")
+    label_confidence = label.get("confidence", 0.0)
+    label_source = label.get("source") or ""
+    candidates = record.get("label_candidates") or []
+    classification = record.get("classification") or {}
+    tone = classification.get("tone_id") or {}
+    cw = classification.get("cw_id") or {}
+
+    parts: list[str] = []
+    if label_text:
+        parts.append(
+            f'<div class="label-best">Best label: <strong>{esc(label_text)}</strong> '
+            f'<span class="pill">{esc(round(float(label_confidence), 3))}</span> '
+            f'<span class="muted">{esc(label_source)}</span></div>'
+        )
+    if tone.get("detected"):
+        parts.append(
+            f'<div class="muted">Tone: {esc(tone.get("frequency_hz"))} Hz, '
+            f'confidence {esc(tone.get("confidence"))}, keyed={esc(tone.get("keyed_candidate"))}</div>'
+        )
+    if cw.get("decoded"):
+        parts.append(
+            f'<div class="muted">CW decode: <strong>{esc(cw.get("text"))}</strong> '
+            f'<span class="pill">{esc(cw.get("confidence"))}</span></div>'
+        )
+    if candidates:
+        rows = []
+        for item in candidates[:8]:
+            rows.append(
+                f'<li><strong>{esc(item.get("label"))}</strong> '
+                f'<span class="pill">{esc(item.get("confidence"))}</span> '
+                f'<span class="muted">{esc(item.get("type"))} / {esc(item.get("source"))}</span></li>'
+            )
+        parts.append(f'<ul class="candidates">{"".join(rows)}</ul>')
+    if not parts:
+        return ""
+    return f'<div class="label-block">{"".join(parts)}</div>'
+
+
+def render_card(record: dict, text_key: str, include_compare: bool = False, include_labels: bool = True) -> str:
     created = esc(record.get("created_utc", ""))
     filename = esc(record.get("file", ""))
     receiver = esc(record.get("receiver", ""))
@@ -60,6 +106,7 @@ def render_card(record: dict, text_key: str, include_compare: bool = False) -> s
 
     error_block = f'<p class="error">{error}</p>' if error else ""
     cleanup_error_block = f'<p class="error">cleanup_error={cleanup_error}</p>' if cleanup_error else ""
+    label_block = render_label_block(record) if include_labels else ""
 
     compare_block = ""
     if include_compare and raw_text and raw_text != text:
@@ -79,14 +126,15 @@ def render_card(record: dict, text_key: str, include_compare: bool = False) -> s
       </div>
       {error_block}
       {cleanup_error_block}
+      {label_block}
       <p>{text}</p>
       {compare_block}
     </article>
     """
 
 
-def render_cards(records: list[dict], text_key: str, include_compare: bool = False) -> str:
-    cards = [render_card(record, text_key=text_key, include_compare=include_compare) for record in records]
+def render_cards(records: list[dict], text_key: str, include_compare: bool = False, include_labels: bool = True) -> str:
+    cards = [render_card(record, text_key=text_key, include_compare=include_compare, include_labels=include_labels) for record in records]
     if not cards:
         cards.append('<article class="card"><p>No transcripts yet.</p></article>')
     return "".join(cards)
@@ -94,8 +142,10 @@ def render_cards(records: list[dict], text_key: str, include_compare: bool = Fal
 
 def build_page(records: list[dict], title: str) -> str:
     processed_records = [record for record in records if is_post_processed(record)]
+    classified_records = [record for record in records if has_classification(record)]
     raw_cards = render_cards(records, text_key="raw_text", include_compare=False)
     processed_cards = render_cards(processed_records, text_key="text", include_compare=True)
+    classification_cards = render_cards(classified_records, text_key="raw_text", include_compare=False, include_labels=True)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -117,7 +167,7 @@ def build_page(records: list[dict], title: str) -> str:
     }}
     header {{ margin-bottom: 1.5rem; }}
     h1 {{ margin: 0 0 .25rem; font-size: 1.9rem; }}
-    .subtle {{ color: #a8a8a8; }}
+    .subtle, .muted {{ color: #a8a8a8; }}
     .tabs {{
       display: flex;
       gap: .5rem;
@@ -137,10 +187,7 @@ def build_page(records: list[dict], title: str) -> str:
       font-size: .95rem;
     }}
     .tab:hover {{ background: #303747; }}
-    .section-title {{
-      margin: 1.5rem 0 .5rem;
-      font-size: 1.35rem;
-    }}
+    .section-title {{ margin: 1.5rem 0 .5rem; font-size: 1.35rem; }}
     .card {{
       background: #1b1d22;
       border: 1px solid #333842;
@@ -150,6 +197,11 @@ def build_page(records: list[dict], title: str) -> str:
       box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
     }}
     .meta {{ color: #aeb4bf; font-size: .9rem; line-height: 1.4; margin-bottom: .7rem; }}
+    .label-block {{ background: #141821; border: 1px solid #2c3444; border-radius: 10px; padding: .7rem .8rem; margin: .75rem 0; }}
+    .label-best {{ margin-bottom: .35rem; }}
+    .pill {{ display: inline-block; border: 1px solid #4a5366; border-radius: 999px; padding: .08rem .45rem; margin-left: .25rem; font-size: .8rem; color: #d8e1f0; }}
+    .candidates {{ margin: .45rem 0 0; padding-left: 1.25rem; }}
+    .candidates li {{ margin: .25rem 0; }}
     p {{ font-size: 1.08rem; line-height: 1.5; }}
     pre {{ white-space: pre-wrap; color: #d1d5db; }}
     details {{ margin-top: .75rem; }}
@@ -161,10 +213,11 @@ def build_page(records: list[dict], title: str) -> str:
 <body>
   <header>
     <h1>{esc(title)}</h1>
-    <div class="subtle">Showing latest {len(records)} raw clips and {len(processed_records)} post-processed clips, oldest at top and newest at bottom. Auto-refreshes every 20 seconds.</div>
+    <div class="subtle">Showing latest {len(records)} raw clips, {len(processed_records)} post-processed clips, and {len(classified_records)} classified clips. Oldest at top and newest at bottom. Auto-refreshes every 20 seconds.</div>
     <nav class="tabs" aria-label="Transcript views">
       <a class="tab" href="#raw-log">Raw Whisper Log ({len(records)})</a>
       <a class="tab" href="#post-processed-log">Post-Processed Log ({len(processed_records)})</a>
+      <a class="tab" href="#classification-log">Classification / Labels ({len(classified_records)})</a>
     </nav>
   </header>
 
@@ -176,6 +229,11 @@ def build_page(records: list[dict], title: str) -> str:
   <section id="post-processed-log">
     <h2 class="section-title">Post-Processed Log</h2>
     {processed_cards}
+  </section>
+
+  <section id="classification-log">
+    <h2 class="section-title">Classification / Labels</h2>
+    {classification_cards}
   </section>
 
   <div id="bottom" class="bottom-anchor"></div>
