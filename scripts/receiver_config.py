@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Read or update receiver tuning in shared_baseband_radio_server.json.
 
-This keeps the active receiver frequency in one place:
+This keeps active receiver tuning in one place:
 
     configs/shared_baseband_radio_server.json -> receivers[].frequency_hz
+    configs/shared_baseband_radio_server.json -> receivers[].mode
 
-The rtl_fm launcher and clip writer should both use this same value so WAV file
-names and sidecar JSON always match the tuned receiver frequency.
+The rtl_fm launcher and clip writer should both use these same values so WAV file
+names and sidecar JSON always match the tuned receiver frequency and mode.
 """
 from __future__ import annotations
 
@@ -63,13 +64,22 @@ def parse_frequency(value: str) -> int:
     return int(round(float(text) * multiplier))
 
 
+def normalize_mode(mode: str) -> str:
+    text = mode.strip().lower()
+    if text in {"wbfm", "wide", "widefm", "wideband", "widebandfm"}:
+        return "wbfm"
+    if text in {"nfm", "fm", "narrow", "narrowfm", "narrowband", "narrowbandfm"}:
+        return "nfm"
+    raise SystemExit(f"unknown mode: {mode}. Use wbfm or nfm")
+
+
 def receiver_summary(receiver: dict[str, Any]) -> dict[str, Any]:
     frequency_hz = int(receiver.get("frequency_hz", 0))
     return {
         "id": receiver.get("id"),
         "name": receiver.get("name"),
         "enabled": receiver.get("enabled", True),
-        "mode": receiver.get("mode", "wbfm"),
+        "mode": normalize_mode(str(receiver.get("mode", "wbfm"))),
         "frequency_hz": frequency_hz,
         "frequency_arg": frequency_label(frequency_hz),
         "bandwidth_hz": receiver.get("bandwidth_hz"),
@@ -79,7 +89,7 @@ def receiver_summary(receiver: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read/update configured receiver frequency")
+    parser = argparse.ArgumentParser(description="Read/update configured receiver frequency and mode")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--receiver", default="rx-1", help="Receiver id or name")
 
@@ -87,9 +97,13 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser("show", help="Print receiver JSON summary")
     subparsers.add_parser("frequency-hz", help="Print receiver frequency in Hz")
     subparsers.add_parser("rtl-fm-frequency", help="Print rtl_fm -f compatible frequency, e.g. 90.700000M")
+    subparsers.add_parser("mode", help="Print receiver mode: wbfm or nfm")
 
-    set_parser = subparsers.add_parser("set-frequency", help="Set receiver frequency")
-    set_parser.add_argument("frequency", help="Frequency like 441.000M, 90.7M, or 441000000")
+    set_freq_parser = subparsers.add_parser("set-frequency", help="Set receiver frequency")
+    set_freq_parser.add_argument("frequency", help="Frequency like 441.000M, 90.7M, or 441000000")
+
+    set_mode_parser = subparsers.add_parser("set-mode", help="Set receiver mode")
+    set_mode_parser.add_argument("mode", help="Mode: wbfm/widebandfm or nfm/narrowbandfm")
 
     return parser.parse_args()
 
@@ -112,12 +126,24 @@ def main() -> int:
         print(frequency_label(int(receiver.get("frequency_hz", 0))))
         return 0
 
+    if args.command == "mode":
+        print(normalize_mode(str(receiver.get("mode", "wbfm"))))
+        return 0
+
     if args.command == "set-frequency":
         old = int(receiver.get("frequency_hz", 0))
         new = parse_frequency(args.frequency)
         receiver["frequency_hz"] = new
         save_config(config_path, data)
         print(f"updated {args.receiver}: frequency_hz {old} -> {new}")
+        return 0
+
+    if args.command == "set-mode":
+        old = normalize_mode(str(receiver.get("mode", "wbfm")))
+        new = normalize_mode(args.mode)
+        receiver["mode"] = new
+        save_config(config_path, data)
+        print(f"updated {args.receiver}: mode {old} -> {new}")
         return 0
 
     return 1
