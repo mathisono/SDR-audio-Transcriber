@@ -5,6 +5,7 @@ CONFIG="configs/shared_baseband_radio_server.json"
 RECEIVER="rx-1"
 SOURCE="MSE-88"
 FREQUENCY_OVERRIDE=""
+MODE_OVERRIDE=""
 GAIN=""
 THRESHOLD=""
 VERBOSE=""
@@ -13,15 +14,15 @@ usage() {
   cat <<'EOF'
 Usage: scripts/start_rtl_fm_receiver.sh [options]
 
-Starts rtl_fm and clip_writer with the same active receiver frequency. By default
-it reads receivers[].frequency_hz from configs/shared_baseband_radio_server.json.
-You can also pass --frequency 442.275M for one-off/live tuning. Either way, the
-same frequency is used for rtl_fm -f and clip_writer metadata/file names.
+Starts rtl_fm and clip_writer with the same active receiver frequency and mode.
+By default it reads receivers[].frequency_hz and receivers[].mode from config.
+You can also pass --frequency 442.275M and/or --mode nfm for one-off/live tuning.
 
 Options:
   --config PATH        Config JSON path. Default: configs/shared_baseband_radio_server.json
   --receiver ID        Receiver id/name from config. Default: rx-1
   --frequency FREQ     Override tuned frequency for this run, e.g. 442.275M or 442275000
+  --mode MODE          Override mode for this run: wbfm, widebandfm, nfm, narrowbandfm, or fm
   --source NAME        Source label for metadata. Default: MSE-88
   --gain DB            Override SDR gain. Default: source.gain_db from config
   --threshold RMS      Override clip_writer RMS threshold. Default: clip_writer.squelch_threshold_rms
@@ -29,11 +30,12 @@ Options:
   -h, --help           Show this help
 
 Examples:
-  scripts/start_rtl_fm_receiver.sh --receiver rx-1
-  scripts/start_rtl_fm_receiver.sh --receiver rx-1 --frequency 442.275M --threshold 450 --verbose
+  scripts/start_rtl_fm_receiver.sh --receiver rx-1 --mode wbfm --frequency 90.7M
+  scripts/start_rtl_fm_receiver.sh --receiver rx-1 --mode nfm --frequency 442.275M --threshold 450 --verbose
 
-Persist the active receiver frequency in config:
+Persist receiver defaults in config:
   .venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-frequency 442.275M
+  .venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-mode nfm
 EOF
 }
 
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --config) CONFIG="$2"; shift 2 ;;
     --receiver) RECEIVER="$2"; shift 2 ;;
     --frequency) FREQUENCY_OVERRIDE="$2"; shift 2 ;;
+    --mode) MODE_OVERRIDE="$2"; shift 2 ;;
     --source) SOURCE="$2"; shift 2 ;;
     --gain) GAIN="$2"; shift 2 ;;
     --threshold) THRESHOLD="$2"; shift 2 ;;
@@ -122,6 +125,24 @@ else:
 PY
 }
 
+normalize_mode() {
+  local mode="${1,,}"
+  case "${mode}" in
+    wbfm|wide|widefm|wideband|widebandfm) echo "wbfm" ;;
+    nfm|fm|narrow|narrowfm|narrowband|narrowbandfm) echo "fm" ;;
+    *) echo "unknown mode: $1 (use wbfm or nfm)" >&2; exit 2 ;;
+  esac
+}
+
+metadata_mode() {
+  local rtl_mode="$1"
+  case "${rtl_mode}" in
+    wbfm) echo "wbfm" ;;
+    fm) echo "nfm" ;;
+    *) echo "${rtl_mode}" ;;
+  esac
+}
+
 if [[ -n "${FREQUENCY_OVERRIDE}" ]]; then
   FREQ_HZ="$(parse_frequency_hz "${FREQUENCY_OVERRIDE}")"
   RTL_FREQ="$(format_rtl_frequency "${FREQ_HZ}")"
@@ -132,7 +153,14 @@ fi
 
 PPM_ARGS="$(${PY} scripts/ppm_config.py --config "${CONFIG}" rtl-fm-args)"
 
-MODE="$(receiver_value "mode" 2>/dev/null || echo wbfm)"
+if [[ -n "${MODE_OVERRIDE}" ]]; then
+  MODE="${MODE_OVERRIDE}"
+else
+  MODE="$(receiver_value "mode" 2>/dev/null || echo wbfm)"
+fi
+RTL_MODE="$(normalize_mode "${MODE}")"
+CLIP_MODE="$(metadata_mode "${RTL_MODE}")"
+
 SAMPLE_RATE="$(read_config_value "source.sample_rate" 2>/dev/null || echo 240000)"
 AUDIO_RATE="$(read_config_value "audio.sample_rate" 2>/dev/null || echo 48000)"
 HANG_MS="$(read_config_value "clip_writer.hang_time_ms" 2>/dev/null || echo 1200)"
@@ -148,15 +176,9 @@ if [[ -z "${THRESHOLD}" ]]; then
   THRESHOLD="$(read_config_value "clip_writer.squelch_threshold_rms" 2>/dev/null || echo 650)"
 fi
 
-case "${MODE}" in
-  wbfm|WBFM) RTL_MODE="wbfm" ;;
-  fm|nfm|NFM) RTL_MODE="fm" ;;
-  *) RTL_MODE="wbfm" ;;
-esac
-
 mkdir -p "${QUEUE_DIR}" "${TMP_DIR}"
 
-echo "receiver_launcher: source=${SOURCE} receiver=${RECEIVER} mode=${RTL_MODE} frequency_hz=${FREQ_HZ} rtl_fm_frequency=${RTL_FREQ} ppm=${PPM_ARGS} gain=${GAIN}"
+echo "receiver_launcher: source=${SOURCE} receiver=${RECEIVER} mode=${CLIP_MODE} rtl_fm_mode=${RTL_MODE} frequency_hz=${FREQ_HZ} rtl_fm_frequency=${RTL_FREQ} ppm=${PPM_ARGS} gain=${GAIN}"
 
 # shellcheck disable=SC2086
 rtl_fm -M "${RTL_MODE}" -f "${RTL_FREQ}" -s "${SAMPLE_RATE}" -r "${AUDIO_RATE}" -g "${GAIN}" ${PPM_ARGS} - | \
@@ -166,7 +188,7 @@ rtl_fm -M "${RTL_MODE}" -f "${RTL_FREQ}" -s "${SAMPLE_RATE}" -r "${AUDIO_RATE}" 
     --source "${SOURCE}" \
     --receiver "${RECEIVER}" \
     --frequency-hz "${FREQ_HZ}" \
-    --mode "${RTL_MODE}" \
+    --mode "${CLIP_MODE}" \
     --sample-rate "${AUDIO_RATE}" \
     --threshold "${THRESHOLD}" \
     --hang-ms "${HANG_MS}" \
