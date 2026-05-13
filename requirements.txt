@@ -1,5 +1,7 @@
 # MSE-88 may be on an older distro Python. Python 3.8 needs older compatible wheels.
 # faster-whisper 0.10.1 depends on av==10.* and works with ctranslate2 4.1.0.
+# PyAV 10 source builds need an older Cython on older distro environments.
+Cython==0.29.37
 av==10.*
 ctranslate2==4.1.0
 tokenizers>=0.13,<0.16
