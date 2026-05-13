@@ -5,34 +5,39 @@ A small SDR audio capture and transcription pipeline for RTL-SDR / GNU Radio exp
 Current goal:
 
 ```text
-Osmocom Source
- ├─> QT GUI Frequency Sink
- ├─> QT GUI Waterfall Sink
- └─> Frequency Xlating FIR Filter
-      └─> WBFM Receive
-           ├─> Audio Sink
-           └─> squelch-gated clip writer
-                └─> runtime/queue/*.wav
-                     └─> faster-whisper transcription worker
-                          └─> LM Studio / Qwen cleanup model
-                               └─> runtime/transcripts/index.html
+Osmocom Source / rtl_fm receiver
+ ├─> frequency/mode controlled from config or launcher args
+ └─> squelch-gated clip writer
+      └─> runtime/queue/*.wav
+           └─> faster-whisper transcription worker
+                └─> optional LM Studio / Qwen cleanup model
+                     └─> runtime/transcripts/*.html
 ```
 
-The GNU Radio flowgraph can stay focused on RF/demodulation while the clip writer, transcription worker, and web page are separate Python processes.
+The RF receiver, clip writer, transcription worker, classifier, and web page are separate pieces. The preferred test path is now `scripts/start_rtl_fm_receiver.sh` because it keeps the tuned frequency, FM mode, WAV filename, and sidecar JSON metadata synchronized.
 
 ## What is included
 
+- `scripts/start_rtl_fm_receiver.sh`  
+  Starts `rtl_fm` and `clip_writer.py` together. Reads receiver frequency/mode from config or accepts one-off command-line overrides like `--frequency 442.275M --mode nfm`.
+
+- `scripts/receiver_config.py`  
+  Shows or updates receiver frequency and mode in `configs/shared_baseband_radio_server.json`.
+
 - `scripts/clip_writer.py`  
-  Reads mono 16-bit PCM audio from stdin, opens a WAV file when RMS rises above the squelch threshold, waits for hang time after audio drops, and moves completed clips into `runtime/queue`.
+  Reads mono 16-bit PCM from stdin, opens a WAV file when RMS rises above the squelch threshold, waits for hang time after audio drops, and moves completed clips into `runtime/queue`. Filenames include source, receiver, tuned frequency, mode, and process ID.
 
 - `scripts/transcribe_worker.py`  
-  Watches `runtime/queue`, moves completed WAV files into `runtime/processing`, runs `faster-whisper`, optionally cleans up the rough text through an OpenAI-compatible model server such as LM Studio, writes transcript JSON, and appends to `runtime/transcripts/index.jsonl`.
+  Watches `runtime/queue`, moves completed WAV files into `runtime/processing`, runs `faster-whisper`, optionally cleans up the rough text through LM Studio/Qwen, optionally classifies CW/tone/spoken callsign evidence, writes transcript JSON, and appends to `runtime/transcripts/index.jsonl`.
+
+- `scripts/clip_classifier.py`  
+  Optional first-pass detector for CW/Morse IDs, tone ID frequency, keyed tone candidates, and spoken callsign label candidates.
 
 - `scripts/build_transcript_page.py`  
-  Builds a simple auto-refreshing static web page at `runtime/transcripts/index.html`.
+  Builds static web pages: `index.html`, `raw.html`, `processed.html`, and `classification.html`.
 
 - `scripts/ppm_config.py`  
-  Shows or sets the shared SDR source PPM correction in `configs/shared_baseband_radio_server.json`.
+  Shows or sets the shared SDR source PPM correction.
 
 - `scripts/audio_fft_ppm_finder_terminal.py`  
   Existing terminal FFT and coarse PPM finder helper.
@@ -77,103 +82,249 @@ PPM correction is a single source-level setting. Set it once here:
 configs/shared_baseband_radio_server.json -> source.ppm_correction
 ```
 
-All receivers and receiver test commands should use this same value.
-
 Show the current value:
 
 ```bash
-python3 scripts/ppm_config.py show
+.venv/bin/python3 scripts/ppm_config.py show
 ```
 
 Set the value once:
 
 ```bash
-python3 scripts/ppm_config.py set 135
+.venv/bin/python3 scripts/ppm_config.py set 135
 ```
 
 Generate `rtl_fm` arguments from config:
 
 ```bash
-python3 scripts/ppm_config.py rtl-fm-args
+.venv/bin/python3 scripts/ppm_config.py rtl-fm-args
 ```
 
-Use the configured PPM value in a command:
-
-```bash
-PPM_ARGS="$(python3 scripts/ppm_config.py rtl-fm-args)"
-rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 ${PPM_ARGS} -
-```
+The receiver launcher uses this automatically.
 
 The existing coarse finder can also write the shared value directly:
 
 ```bash
-python3 scripts/audio_fft_ppm_finder_terminal.py ppm \
+.venv/bin/python3 scripts/audio_fft_ppm_finder_terminal.py ppm \
   --frequency 90700000 \
   --write-config
+```
+
+## Receiver frequency and FM mode
+
+Receiver tuning lives in:
+
+```text
+configs/shared_baseband_radio_server.json -> receivers[].frequency_hz
+configs/shared_baseband_radio_server.json -> receivers[].mode
+```
+
+The preferred launcher is:
+
+```bash
+scripts/start_rtl_fm_receiver.sh
+```
+
+It uses the same active frequency and mode for both:
+
+```text
+rtl_fm -f / -M
+clip_writer.py --frequency-hz / --mode
+```
+
+That keeps WAV filenames and JSON metadata correct.
+
+### One-off wideband FM
+
+Use wideband FM for broadcast FM or other wide FM sources:
+
+```bash
+scripts/start_rtl_fm_receiver.sh \
+  --receiver rx-1 \
+  --source MSE-88 \
+  --mode wbfm \
+  --frequency 90.7M \
+  --verbose
+```
+
+Accepted wideband names:
+
+```text
+wbfm
+widebandfm
+widefm
+wide
+```
+
+Internally this runs `rtl_fm -M wbfm`, and the clip metadata/file name uses `wbfm`.
+
+### One-off narrowband FM
+
+Use narrowband FM for typical ham/public-service voice channels and repeaters:
+
+```bash
+scripts/start_rtl_fm_receiver.sh \
+  --receiver rx-1 \
+  --source MSE-88 \
+  --mode nfm \
+  --frequency 442.275M \
+  --threshold 450 \
+  --verbose
+```
+
+Accepted narrowband names:
+
+```text
+nfm
+narrowbandfm
+narrowfm
+narrow
+fm
+```
+
+For `rtl_fm`, narrowband FM maps to:
+
+```text
+-M fm
+```
+
+The clip metadata/file name uses:
+
+```text
+nfm
+```
+
+Example output filename:
+
+```text
+2026-05-13_153012.428Z__MSE-88__rx-1__442.275000MHz__nfm__pid1234.wav
+```
+
+### Persist frequency and mode in config
+
+Set receiver frequency:
+
+```bash
+.venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-frequency 442.275M
+```
+
+Set receiver to narrowband FM:
+
+```bash
+.venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-mode nfm
+```
+
+Set receiver to wideband FM:
+
+```bash
+.venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-mode wbfm
+```
+
+Show current receiver settings:
+
+```bash
+.venv/bin/python3 scripts/receiver_config.py --receiver rx-1 show
+```
+
+Start using config defaults:
+
+```bash
+scripts/start_rtl_fm_receiver.sh --receiver rx-1 --source MSE-88 --verbose
+```
+
+### Frequency format examples
+
+All of these are valid:
+
+```text
+442.275M
+442.275MHz
+442275000
+90.7M
+90700000
 ```
 
 ## First test using rtl_fm
 
 This bypasses GNU Radio and proves the audio capture/transcription pipeline first.
 
-Terminal 1: record squelch-gated clips from 90.7 MHz WBFM using the configured PPM value:
+Terminal 1: start the receiver and squelch-gated clip writer.
+
+For a narrowband repeater:
 
 ```bash
-source .venv/bin/activate
-PPM_ARGS="$(python3 scripts/ppm_config.py rtl-fm-args)"
-rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 ${PPM_ARGS} - | \
-  python3 scripts/clip_writer.py \
-    --source MSE-88 \
-    --frequency 90700000 \
-    --receiver receiver1 \
-    --sample-rate 48000 \
-    --threshold 650 \
-    --hang-ms 1200
+cd /home/mat/SDR-audio-Transcriber
+scripts/start_rtl_fm_receiver.sh \
+  --receiver rx-1 \
+  --source MSE-88 \
+  --mode nfm \
+  --frequency 442.275M \
+  --threshold 450 \
+  --verbose
+```
+
+For broadcast FM testing:
+
+```bash
+cd /home/mat/SDR-audio-Transcriber
+scripts/start_rtl_fm_receiver.sh \
+  --receiver rx-1 \
+  --source MSE-88 \
+  --mode wbfm \
+  --frequency 90.7M \
+  --verbose
 ```
 
 Terminal 2: transcribe completed clips without LM Studio cleanup:
 
 ```bash
-source .venv/bin/activate
-python3 scripts/transcribe_worker.py \
+cd /home/mat/SDR-audio-Transcriber
+.venv/bin/python3 scripts/transcribe_worker.py \
   --whisper-model small.en \
   --device cpu \
   --compute-type int8 \
-  --no-cleanup
+  --no-cleanup \
+  --enable-classifier
 ```
 
-Terminal 2 alternative: transcribe with LM Studio cleanup on a remote box:
+Terminal 2 alternative: transcribe with LM Studio/Qwen cleanup on a remote box:
 
 ```bash
-source .venv/bin/activate
-python3 scripts/transcribe_worker.py \
+cd /home/mat/SDR-audio-Transcriber
+.venv/bin/python3 scripts/transcribe_worker.py \
   --whisper-model small.en \
   --device cpu \
   --compute-type int8 \
-  --lmstudio-host 192.168.3.28
+  --lmstudio-host 192.168.3.28 \
+  --lmstudio-port 1234 \
+  --enable-classifier
 ```
 
 You can also pass the full OpenAI-compatible URL:
 
 ```bash
-python3 scripts/transcribe_worker.py \
+.venv/bin/python3 scripts/transcribe_worker.py \
   --whisper-model small.en \
   --device cpu \
   --compute-type int8 \
-  --lmstudio-url http://192.168.3.28:1234/v1
+  --lmstudio-url http://192.168.3.28:1234/v1 \
+  --enable-classifier
 ```
 
 Terminal 3: serve the transcript web page:
 
 ```bash
-cd runtime/transcripts
-python3 -m http.server 8090
+cd /home/mat/SDR-audio-Transcriber/runtime/transcripts
+python3 -m http.server 8090 --bind 0.0.0.0
 ```
 
 Open:
 
 ```text
-http://localhost:8090/
+http://MSE-88:8090/
+http://MSE-88:8090/raw.html
+http://MSE-88:8090/processed.html
+http://MSE-88:8090/classification.html
 ```
 
 ## LM Studio cleanup model
@@ -195,40 +346,35 @@ http://127.0.0.1:1234/v1
 For LM Studio running on another machine, pass just the host/IP:
 
 ```bash
-python3 scripts/transcribe_worker.py --lmstudio-host 192.168.3.28
+.venv/bin/python3 scripts/transcribe_worker.py --lmstudio-host 192.168.3.28 --enable-classifier
 ```
 
 If LM Studio is on a non-default port:
 
 ```bash
-python3 scripts/transcribe_worker.py --lmstudio-host 192.168.3.28 --lmstudio-port 1234
-```
-
-Or pass the full OpenAI-compatible base URL:
-
-```bash
-python3 scripts/transcribe_worker.py --lmstudio-url http://192.168.3.28:1234/v1
+.venv/bin/python3 scripts/transcribe_worker.py --lmstudio-host 192.168.3.28 --lmstudio-port 1234 --enable-classifier
 ```
 
 If LM Studio is not running yet, disable cleanup:
 
 ```bash
-python3 scripts/transcribe_worker.py --no-cleanup
+.venv/bin/python3 scripts/transcribe_worker.py --no-cleanup --enable-classifier
 ```
 
 ## Runtime folders
 
 ```text
 runtime/
-  queue/          completed WAV clips waiting for transcription
-  tmp/            partial WAV clips while squelch is open
-  processing/     files currently owned by the worker
-  done/           processed WAV clips and transcript JSON
-  failed/         failed clips
-  transcripts/    index.jsonl and index.html
+  queue/                     completed WAV clips waiting for transcription
+  tmp/                       partial WAV clips while squelch is open
+  processing/                files currently owned by the worker
+  done/                      processed WAV clips and transcript JSON
+  failed/                    failed clips
+  transcripts/               index.jsonl and static HTML pages
+  classification_state.json  persistent evidence state for label promotion
 ```
 
-Only `.gitkeep` placeholders are committed. Audio files and generated transcripts are ignored by Git.
+Only `.gitkeep` placeholders are committed. Audio files, generated transcripts, and runtime classification state are ignored by Git.
 
 ## GNU Radio integration notes
 
@@ -239,20 +385,20 @@ Osmocom Source
  ├─> QT GUI Frequency Sink
  ├─> QT GUI Waterfall Sink
  └─> Frequency Xlating FIR Filter
-      └─> WBFM Receive
+      └─> WBFM or NFM receive path
            └─> Audio Sink
 ```
 
-The easiest next integration is to tee demodulated audio into a pipe or UDP stream and feed `clip_writer.py` with mono 48 kHz signed 16-bit PCM.
+The easiest integration is to tee demodulated audio into a pipe or UDP stream and feed `clip_writer.py` with mono 48 kHz signed 16-bit PCM. Make sure the GNU Radio/control layer passes the actual tuned frequency and mode to `clip_writer.py`, or use the launcher approach as the reference pattern.
 
 For example, conceptually:
 
 ```text
-WBFM Receive
+FM Receive
  ├─> Audio Sink
  └─> Float to Short / PCM path
       └─> File Sink or pipe
-           └─> scripts/clip_writer.py
+           └─> scripts/clip_writer.py --frequency-hz <active frequency> --mode <wbfm|nfm>
 ```
 
 Do not send partially written files directly to the worker. The clip writer writes `*.wav.part` in `runtime/tmp` and only renames a completed file into `runtime/queue` after squelch closes.
@@ -268,24 +414,26 @@ Important recorder settings:
 --max-sec 60.0        # force-close long clips
 ```
 
-If it records too much noise, raise `--threshold`. If it clips off the end of speech, raise `--hang-ms`.
+If it records too much noise, raise `--threshold`. If it misses quiet audio, lower `--threshold`. If it clips off the end of speech, raise `--hang-ms`.
 
 ## GPU transcription
 
 For NVIDIA CUDA systems, use a larger model and float16:
 
 ```bash
-python3 scripts/transcribe_worker.py \
+.venv/bin/python3 scripts/transcribe_worker.py \
   --whisper-model medium.en \
   --device cuda \
-  --compute-type float16
+  --compute-type float16 \
+  --enable-classifier
 ```
 
 For small CPU systems, keep:
 
 ```bash
-python3 scripts/transcribe_worker.py \
+.venv/bin/python3 scripts/transcribe_worker.py \
   --whisper-model small.en \
   --device cpu \
-  --compute-type int8
+  --compute-type int8 \
+  --enable-classifier
 ```
