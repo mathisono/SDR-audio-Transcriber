@@ -65,6 +65,25 @@ def normalize_lmstudio_url(host: str | None, port: int, url: str | None) -> str:
     return base
 
 
+def available_models(base_url: str, timeout: int = 20) -> list[str]:
+    response = requests.get(f"{base_url.rstrip('/')}/models", timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    return [str(item.get("id")) for item in payload.get("data", []) if item.get("id")]
+
+
+def resolve_model(base_url: str, requested_model: str, timeout: int = 20) -> str:
+    if requested_model != "auto":
+        return requested_model
+    models = available_models(base_url, timeout=timeout)
+    if not models:
+        raise SystemExit(f"No models returned by {base_url}/models")
+    preferred = [m for m in models if "transcriber" in m.lower() or "qwen" in m.lower()]
+    chosen = preferred[0] if preferred else models[0]
+    print(f"model auto-selected: {chosen}")
+    return chosen
+
+
 def load_records(jsonl_path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     if not jsonl_path.exists():
@@ -129,11 +148,27 @@ def extract_context(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build_prompt(records: list[dict[str, Any]], source_text: str, title: str) -> str:
+def trim_to_max_chars(lines: list[str], max_chars: int) -> list[str]:
+    if max_chars <= 0:
+        return lines
+    kept: list[str] = []
+    total = 0
+    # Keep newest records when trimming, but preserve chronological order in the final prompt.
+    for line in reversed(lines):
+        line_len = len(line) + 1
+        if kept and total + line_len > max_chars:
+            break
+        kept.append(line)
+        total += line_len
+    return list(reversed(kept))
+
+
+def build_prompt(records: list[dict[str, Any]], source_text: str, title: str, max_chars: int) -> tuple[str, int]:
     lines = [line for record in records if (line := record_line(record, source_text))]
+    lines = trim_to_max_chars(lines, max_chars)
     context = extract_context(records)
     body = "\n".join(lines)
-    return f"""
+    prompt = f"""
 You are formatting a radio-monitoring transcript from SDR audio clips.
 
 Task:
@@ -153,9 +188,10 @@ Known context extracted from classifier/transcripts:
 Source clip log:
 {body}
 """.strip()
+    return prompt, len(lines)
 
 
-def call_model(prompt: str, base_url: str, model: str, timeout: int) -> str:
+def call_model(prompt: str, base_url: str, model: str, timeout: int, max_tokens: int) -> str:
     payload = {
         "model": model,
         "messages": [
@@ -166,9 +202,13 @@ def call_model(prompt: str, base_url: str, model: str, timeout: int) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
+        "max_tokens": max_tokens,
     }
-    response = requests.post(f"{base_url.rstrip('/')}/chat/completions", json=payload, timeout=timeout)
-    response.raise_for_status()
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    response = requests.post(url, json=payload, timeout=timeout)
+    if response.status_code >= 400:
+        body = response.text.strip()
+        raise RuntimeError(f"LM Studio request failed: HTTP {response.status_code} {response.reason}\nURL: {url}\nModel: {model}\nResponse body:\n{body[:4000]}")
     return response.json()["choices"][0]["message"]["content"].strip()
 
 
@@ -177,7 +217,6 @@ def esc(value: object) -> str:
 
 
 def markdownish_to_html(text: str) -> str:
-    # Simple safe renderer: escape all text, then preserve paragraphs/line breaks.
     escaped = esc(text)
     escaped = re.sub(r"^###\s+(.+)$", r"<h3>\1</h3>", escaped, flags=re.MULTILINE)
     escaped = re.sub(r"^##\s+(.+)$", r"<h2>\1</h2>", escaped, flags=re.MULTILINE)
@@ -239,13 +278,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reprocess transcript history into a larger Qwen-formatted transcript")
     parser.add_argument("--transcripts", default="runtime/transcripts")
     parser.add_argument("--limit", type=int, default=200, help="Number of latest records to format. Use 0 for all records.")
+    parser.add_argument("--max-chars", type=int, default=24000, help="Maximum source-log characters sent to the model. Use 0 for no cap.")
     parser.add_argument("--source-text", choices=["best", "raw", "processed"], default="best")
     parser.add_argument("--title", default="Formatted Radio Transcript")
     parser.add_argument("--lmstudio-host", default="127.0.0.1")
     parser.add_argument("--lmstudio-port", type=int, default=1234)
     parser.add_argument("--lmstudio-url", default=None)
-    parser.add_argument("--model", default="bingbangboom/Qwen3508B-transcriber-15k-03")
+    parser.add_argument("--model", default="auto", help="Model id or auto. auto selects the first qwen/transcriber-looking loaded model.")
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--list-models", action="store_true", help="List models from LM Studio and exit")
     parser.add_argument("--dry-run", action="store_true", help="Write prompt file only; do not call model")
     return parser.parse_args()
 
@@ -254,32 +296,42 @@ def main() -> int:
     args = parse_args()
     transcript_dir = Path(args.transcripts)
     jsonl_path = transcript_dir / "index.jsonl"
+    base_url = normalize_lmstudio_url(args.lmstudio_host, args.lmstudio_port, args.lmstudio_url)
+
+    if args.list_models:
+        for model in available_models(base_url, timeout=args.timeout):
+            print(model)
+        return 0
+
     records = load_records(jsonl_path)
     if args.limit and args.limit > 0:
         records = records[-args.limit:]
     if not records:
         raise SystemExit(f"no records found in {jsonl_path}")
 
-    base_url = normalize_lmstudio_url(args.lmstudio_host, args.lmstudio_port, args.lmstudio_url)
+    model = resolve_model(base_url, args.model, timeout=args.timeout)
     generated_utc = utc_iso()
-    prompt = build_prompt(records, args.source_text, args.title)
+    prompt, prompt_record_lines = build_prompt(records, args.source_text, args.title, args.max_chars)
     prompt_path = transcript_dir / "formatted_prompt.txt"
     prompt_path.write_text(prompt, encoding="utf-8")
 
     metadata = {
         "generated_utc": generated_utc,
-        "record_count": len(records),
+        "records_loaded": len(records),
+        "records_in_prompt": prompt_record_lines,
+        "prompt_chars": len(prompt),
+        "max_chars": args.max_chars,
         "first_record_time": records[0].get("started_utc") or records[0].get("created_utc"),
         "last_record_time": records[-1].get("started_utc") or records[-1].get("created_utc"),
         "source_text": args.source_text,
-        "model": args.model,
+        "model": model,
         "endpoint": base_url,
     }
 
     if args.dry_run:
         formatted = "Dry run only. Prompt was written to formatted_prompt.txt."
     else:
-        formatted = call_model(prompt, base_url, args.model, args.timeout)
+        formatted = call_model(prompt, base_url, model, args.timeout, args.max_tokens)
 
     output = {
         **metadata,
