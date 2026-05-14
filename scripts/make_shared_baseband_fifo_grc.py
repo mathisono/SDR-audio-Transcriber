@@ -6,7 +6,7 @@ The outputs keep the same GUI/layout style as the reference flowgraph and add:
 - audio_gain QT slider
 - Multiply Const on demod audio
 - Float to Short
-- File Sink writing mono s16le PCM to runtime/grc_audio.pcm
+- File Sink writing mono s16le PCM to the FIFO used by start_grc_clip_writer.sh
 
 By default this writes both:
   grc/shared_baseband_one_channel_fifo_wbfm.grc
@@ -43,14 +43,21 @@ def replace_first(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
-def extra_fifo_vars() -> str:
+def grc_string_value(value: str) -> str:
+    # GRC variable value is a Python string expression, represented in YAML.
+    # Example: '"/home/mat/repo/runtime/grc_audio.pcm"'
+    escaped = value.replace('"', '\\"')
+    return f"'\"{escaped}\"'"
+
+
+def extra_fifo_vars(fifo_path: str) -> str:
     return "\n".join([
         block(
             "fifo_path",
             "variable",
             {
-                "comment": "'FIFO created by scripts/start_grc_clip_writer.sh'",
-                "value": "'\"runtime/grc_audio.pcm\"'",
+                "comment": "'FIFO created by scripts/start_grc_clip_writer.sh. Absolute path avoids GRC working-directory problems.'",
+                "value": grc_string_value(fifo_path),
             },
             "[160, 200]",
         ),
@@ -145,7 +152,7 @@ def nbfm_block() -> str:
     )
 
 
-def generate_variant(source_text: str, mode: str) -> str:
+def generate_variant(source_text: str, mode: str, fifo_path: str) -> str:
     mode = mode.lower()
     if mode not in {"wbfm", "nfm"}:
         raise ValueError(mode)
@@ -182,7 +189,7 @@ def generate_variant(source_text: str, mode: str) -> str:
         text = text.replace("analog_wfm_rcv_0", "analog_nbfm_rx_0")
 
     marker = "- name: chan1_cutoff\n"
-    text = replace_first(text, marker, extra_fifo_vars() + "\n" + marker)
+    text = replace_first(text, marker, extra_fifo_vars(fifo_path) + "\n" + marker)
     text = replace_first(text, "connections:\n", fifo_blocks() + "\nconnections:\n")
 
     demod_name = "analog_nbfm_rx_0" if mode == "nfm" else "analog_wfm_rcv_0"
@@ -203,22 +210,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate shared-baseband FIFO GRC variants")
     parser.add_argument("--input", default="grc/shared_baseband_one_channel.grc")
     parser.add_argument("--mode", choices=["both", "wbfm", "nfm"], default="both")
+    parser.add_argument("--fifo", default=None, help="Absolute FIFO path to write in generated GRC. Defaults to repo/runtime/grc_audio.pcm")
     parser.add_argument("--output", default=None, help="Output path. Only valid with --mode wbfm or --mode nfm.")
     args = parser.parse_args()
 
-    source_text = Path(args.input).read_text(encoding="utf-8")
+    repo_root = Path(__file__).resolve().parents[1]
+    source_text = (repo_root / args.input).read_text(encoding="utf-8") if not Path(args.input).is_absolute() else Path(args.input).read_text(encoding="utf-8")
+    fifo_path = str(Path(args.fifo).expanduser().resolve()) if args.fifo else str((repo_root / "runtime" / "grc_audio.pcm").resolve())
     modes = ["wbfm", "nfm"] if args.mode == "both" else [args.mode]
 
     for mode in modes:
         if args.output and len(modes) == 1:
             out_path = Path(args.output)
+            if not out_path.is_absolute():
+                out_path = repo_root / out_path
         elif args.output:
             raise SystemExit("--output can only be used when --mode is wbfm or nfm")
         else:
-            out_path = Path(f"grc/shared_baseband_one_channel_fifo_{mode}.grc")
-        out_path.write_text(generate_variant(source_text, mode), encoding="utf-8")
+            out_path = repo_root / f"grc/shared_baseband_one_channel_fifo_{mode}.grc"
+        out_path.write_text(generate_variant(source_text, mode, fifo_path), encoding="utf-8")
         print(f"wrote {out_path}")
 
+    print(f"GRC FIFO path is: {fifo_path}")
     print("Open with: gnuradio-companion grc/shared_baseband_one_channel_fifo_wbfm.grc")
     print("      or: gnuradio-companion grc/shared_baseband_one_channel_fifo_nfm.grc")
     return 0
