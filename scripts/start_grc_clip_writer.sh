@@ -9,12 +9,12 @@ SOURCE="MSE-88"
 RECEIVER="rx-grc-1"
 FREQUENCY="442.275M"
 MODE="nfm"
-SAMPLE_RATE="24000"
-THRESHOLD="60"
+SAMPLE_RATE=""
+THRESHOLD=""
 HANG_MS="1800"
 QUEUE="runtime/queue"
 TMP="runtime/tmp"
-FIFO="runtime/grc_audio.pcm"
+FIFO=""
 VERBOSE=""
 
 usage() {
@@ -24,15 +24,23 @@ Usage: scripts/start_grc_clip_writer.sh [options]
 Starts clip_writer.py reading from a FIFO. Open the matching GRC flowgraph and
 make its File Sink write mono signed 16-bit PCM to the same FIFO path.
 
+The default FIFO is the repo-absolute path:
+  /path/to/SDR-audio-Transcriber/runtime/grc_audio.pcm
+
+That matches the generated GRC files from:
+  .venv/bin/python3 scripts/make_shared_baseband_fifo_grc.py
+
 Options:
   --source NAME         Metadata source label. Default: MSE-88
   --receiver ID         Metadata receiver label. Default: rx-grc-1
-  --frequency FREQ      Frequency metadata, e.g. 442.275M or 162.4M
-  --mode MODE           Metadata mode: nfm or wbfm
+  --frequency FREQ      Frequency metadata, e.g. 442.275M, 162.4M, or 90.7M
+  --mode MODE           Metadata mode: nfm, fm, wbfm, widefm
   --sample-rate HZ      PCM sample rate from GRC. Must match GRC output rate.
-  --threshold RMS       clip_writer RMS threshold
-  --hang-ms MS          clip_writer hang time
-  --fifo PATH           FIFO path. Default: runtime/grc_audio.pcm
+                        Default: 24000 for nfm/fm, 48000 for wbfm/widefm.
+  --threshold RMS       clip_writer RMS threshold.
+                        Default: 80 for nfm/fm, 60 for wbfm/widefm.
+  --hang-ms MS          clip_writer hang time. Default: 1800
+  --fifo PATH           FIFO path. Default: repo/runtime/grc_audio.pcm absolute path
   --queue PATH          Queue directory. Default: runtime/queue
   --tmp PATH            Temp directory. Default: runtime/tmp
   --verbose             Pass --verbose to clip_writer
@@ -40,10 +48,15 @@ Options:
 
 Typical NFM test:
   scripts/start_grc_clip_writer.sh \
-    --receiver rx-grc-1 --source MSE-88 --mode nfm --frequency 442.275M \
-    --sample-rate 24000 --threshold 60 --hang-ms 1800 --verbose
+    --receiver rx-grc-nfm --source MSE-88 --mode nfm --frequency 162.4M \
+    --threshold 80 --hang-ms 1800 --verbose
 
-Then start/open the GRC flowgraph and press Run.
+Typical WBFM test:
+  scripts/start_grc_clip_writer.sh \
+    --receiver rx-grc-wbfm --source MSE-88 --mode wbfm --frequency 90.7M \
+    --threshold 60 --hang-ms 1800 --verbose
+
+Then start/open the matching generated GRC flowgraph and press Run.
 EOF
 }
 
@@ -67,6 +80,15 @@ elif text.endswith('k'):
     mult = 1_000
 print(int(round(float(text) * mult)))
 PY
+}
+
+normalize_mode() {
+  local mode="${1,,}"
+  case "${mode}" in
+    nfm|fm|narrow|narrowfm|narrowband|narrowbandfm) echo "nfm" ;;
+    wbfm|wide|widefm|wideband|widebandfm) echo "wbfm" ;;
+    *) echo "unknown mode: $1 (use nfm or wbfm)" >&2; exit 2 ;;
+  esac
 }
 
 while [[ $# -gt 0 ]]; do
@@ -95,6 +117,37 @@ if [[ ! -x "${PY}" ]]; then
   PY="python3"
 fi
 
+MODE="$(normalize_mode "${MODE}")"
+
+if [[ -z "${FIFO}" ]]; then
+  FIFO="${ROOT_DIR}/runtime/grc_audio.pcm"
+elif [[ "${FIFO}" != /* ]]; then
+  FIFO="${ROOT_DIR}/${FIFO}"
+fi
+
+if [[ "${QUEUE}" != /* ]]; then
+  QUEUE="${ROOT_DIR}/${QUEUE}"
+fi
+if [[ "${TMP}" != /* ]]; then
+  TMP="${ROOT_DIR}/${TMP}"
+fi
+
+if [[ -z "${SAMPLE_RATE}" ]]; then
+  if [[ "${MODE}" == "nfm" ]]; then
+    SAMPLE_RATE="24000"
+  else
+    SAMPLE_RATE="48000"
+  fi
+fi
+
+if [[ -z "${THRESHOLD}" ]]; then
+  if [[ "${MODE}" == "nfm" ]]; then
+    THRESHOLD="80"
+  else
+    THRESHOLD="60"
+  fi
+fi
+
 FREQUENCY_HZ="$(parse_frequency_hz "${FREQUENCY}")"
 mkdir -p "${QUEUE}" "${TMP}" "$(dirname "${FIFO}")"
 rm -f "${FIFO}"
@@ -105,7 +158,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "grc_clip_writer: waiting on fifo=${FIFO} source=${SOURCE} receiver=${RECEIVER} mode=${MODE} frequency_hz=${FREQUENCY_HZ} sample_rate=${SAMPLE_RATE} threshold=${THRESHOLD} hang_ms=${HANG_MS}"
+echo "grc_clip_writer: waiting on fifo=${FIFO} source=${SOURCE} receiver=${RECEIVER} mode=${MODE} frequency_hz=${FREQUENCY_HZ} sample_rate=${SAMPLE_RATE} threshold=${THRESHOLD} hang_ms=${HANG_MS} queue=${QUEUE} tmp=${TMP}"
 
 cat "${FIFO}" | "${PY}" scripts/clip_writer.py \
   --queue "${QUEUE}" \
