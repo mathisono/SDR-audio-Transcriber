@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Generate a FIFO-enabled GRC from shared_baseband_one_channel.grc.
+"""Generate FIFO-enabled GRC variants from shared_baseband_one_channel.grc.
 
-The output keeps the same GUI/layout style as the reference flowgraph and adds:
+The outputs keep the same GUI/layout style as the reference flowgraph and add:
 - fifo_path variable
 - audio_gain QT slider
 - Multiply Const on demod audio
 - Float to Short
 - File Sink writing mono s16le PCM to runtime/grc_audio.pcm
+
+By default this writes both:
+  grc/shared_baseband_one_channel_fifo_wbfm.grc
+  grc/shared_baseband_one_channel_fifo_nfm.grc
 
 Run from repo root:
   .venv/bin/python3 scripts/make_shared_baseband_fifo_grc.py
@@ -39,30 +43,8 @@ def replace_first(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate shared_baseband_one_channel_fifo.grc")
-    parser.add_argument("--input", default="grc/shared_baseband_one_channel.grc")
-    parser.add_argument("--output", default="grc/shared_baseband_one_channel_fifo.grc")
-    args = parser.parse_args()
-
-    in_path = Path(args.input)
-    out_path = Path(args.output)
-    text = in_path.read_text(encoding="utf-8")
-
-    text = replace_first(text, "id: shared_baseband_one_channel", "id: shared_baseband_one_channel_fifo")
-    text = replace_first(text, "title: Shared Baseband One Channel", "title: Shared Baseband One Channel FIFO")
-    text = replace_first(
-        text,
-        "description: RTL-SDR shared baseband with one WBFM demod branch",
-        "description: RTL-SDR shared baseband with one WBFM demod branch plus FIFO PCM output for SDR-audio-Transcriber",
-    )
-    text = replace_first(
-        text,
-        "comment: First working shared-baseband one-channel test flowgraph",
-        "comment: Shared-baseband one-channel test flowgraph with FIFO recorder output",
-    )
-
-    extra_vars = "\n".join([
+def extra_fifo_vars() -> str:
+    return "\n".join([
         block(
             "fifo_path",
             "variable",
@@ -92,10 +74,9 @@ def main() -> int:
         ),
     ])
 
-    marker = "- name: chan1_cutoff\n"
-    text = replace_first(text, marker, extra_vars + "\n" + marker)
 
-    fifo_blocks = "\n".join([
+def fifo_blocks() -> str:
+    return "\n".join([
         block(
             "blocks_multiply_const_vxx_0",
             "blocks_multiply_const_vxx",
@@ -144,22 +125,102 @@ def main() -> int:
         ),
     ])
 
-    text = replace_first(text, "connections:\n", fifo_blocks + "\nconnections:\n")
 
-    text = text.replace("- [analog_wfm_rcv_0, '0', audio_sink_0, '0']\n", "")
+def nbfm_block() -> str:
+    return block(
+        "analog_nbfm_rx_0",
+        "analog_nbfm_rx",
+        {
+            "affinity": "''",
+            "alias": "''",
+            "audio_rate": "audio_rate",
+            "comment": "'Narrowband FM demod for repeater / NOAA / land-mobile voice monitoring'",
+            "max_dev": "'5000'",
+            "maxoutbuf": "'0'",
+            "minoutbuf": "'0'",
+            "quad_rate": "samp_rate/chan1_decim",
+            "tau": "'75e-6'",
+        },
+        "[1016, 620]",
+    )
+
+
+def generate_variant(source_text: str, mode: str) -> str:
+    mode = mode.lower()
+    if mode not in {"wbfm", "nfm"}:
+        raise ValueError(mode)
+
+    text = source_text
+    suffix = f"fifo_{mode}"
+    title_mode = mode.upper()
+
+    text = replace_first(text, "id: shared_baseband_one_channel", f"id: shared_baseband_one_channel_{suffix}")
+    text = replace_first(text, "title: Shared Baseband One Channel", f"title: Shared Baseband One Channel FIFO {title_mode}")
+    text = replace_first(
+        text,
+        "description: RTL-SDR shared baseband with one WBFM demod branch",
+        f"description: RTL-SDR shared baseband with one {title_mode} demod branch plus FIFO PCM output for SDR-audio-Transcriber",
+    )
+    text = replace_first(
+        text,
+        "comment: First working shared-baseband one-channel test flowgraph",
+        f"comment: Shared-baseband one-channel {title_mode} test flowgraph with FIFO recorder output",
+    )
+
+    if mode == "nfm":
+        text = text.replace("value: '48000'", "value: '24000'", 1)
+        text = text.replace("value: '90700000'", "value: '162400000'", 1)
+        text = text.replace("value: '25'", "value: '42'", 1)
+        text = text.replace("value: '75000'", "value: '12000'", 1)
+        text = text.replace("value: '10000'", "value: '3000'", 1)
+
+        start = text.find("- name: analog_wfm_rcv_0\n")
+        end = text.find("- name: audio_sink_0\n", start)
+        if start == -1 or end == -1:
+            raise SystemExit("Could not locate WBFM block to replace for NFM variant")
+        text = text[:start] + nbfm_block() + "\n" + text[end:]
+        text = text.replace("analog_wfm_rcv_0", "analog_nbfm_rx_0")
+
+    marker = "- name: chan1_cutoff\n"
+    text = replace_first(text, marker, extra_fifo_vars() + "\n" + marker)
+    text = replace_first(text, "connections:\n", fifo_blocks() + "\nconnections:\n")
+
+    demod_name = "analog_nbfm_rx_0" if mode == "nfm" else "analog_wfm_rcv_0"
+    text = text.replace(f"- [{demod_name}, '0', audio_sink_0, '0']\n", "")
     text = replace_first(
         text,
         "connections:\n",
         "connections:\n"
-        "- [analog_wfm_rcv_0, '0', audio_sink_0, '0']\n"
-        "- [analog_wfm_rcv_0, '0', blocks_multiply_const_vxx_0, '0']\n"
+        f"- [{demod_name}, '0', audio_sink_0, '0']\n"
+        f"- [{demod_name}, '0', blocks_multiply_const_vxx_0, '0']\n"
         "- [blocks_multiply_const_vxx_0, '0', blocks_float_to_short_0, '0']\n"
         "- [blocks_float_to_short_0, '0', blocks_file_sink_0, '0']\n",
     )
+    return text
 
-    out_path.write_text(text, encoding="utf-8")
-    print(f"wrote {out_path}")
-    print("Open it with: gnuradio-companion grc/shared_baseband_one_channel_fifo.grc")
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate shared-baseband FIFO GRC variants")
+    parser.add_argument("--input", default="grc/shared_baseband_one_channel.grc")
+    parser.add_argument("--mode", choices=["both", "wbfm", "nfm"], default="both")
+    parser.add_argument("--output", default=None, help="Output path. Only valid with --mode wbfm or --mode nfm.")
+    args = parser.parse_args()
+
+    source_text = Path(args.input).read_text(encoding="utf-8")
+    modes = ["wbfm", "nfm"] if args.mode == "both" else [args.mode]
+
+    for mode in modes:
+        if args.output and len(modes) == 1:
+            out_path = Path(args.output)
+        elif args.output:
+            raise SystemExit("--output can only be used when --mode is wbfm or nfm")
+        else:
+            out_path = Path(f"grc/shared_baseband_one_channel_fifo_{mode}.grc")
+        out_path.write_text(generate_variant(source_text, mode), encoding="utf-8")
+        print(f"wrote {out_path}")
+
+    print("Open with: gnuradio-companion grc/shared_baseband_one_channel_fifo_wbfm.grc")
+    print("      or: gnuradio-companion grc/shared_baseband_one_channel_fifo_nfm.grc")
     return 0
 
 
