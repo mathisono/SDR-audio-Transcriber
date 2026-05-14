@@ -1,0 +1,241 @@
+options:
+  parameters:
+    author: Mathison Ott / ChatGPT
+    category: '[SDR-audio-Transcriber]'
+    cmake_opt: ''
+    comment: 'NFM receiver monitor that writes mono s16le PCM to runtime/grc_audio.pcm FIFO for scripts/start_grc_clip_writer.sh'
+    copyright: ''
+    description: 'RTL-SDR/Osmocom NFM acquisition with QT spectrum/waterfall/audio monitor and FIFO PCM output for clip_writer.py.'
+    gen_cmake: 'On'
+    gen_linking: dynamic
+    generate_options: qt_gui
+    hier_block_src_path: '.:'
+    id: sdr_audio_transcriber_nfm_fifo
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: SDR Audio Transcriber NFM FIFO
+    window_size: 1280, 900
+
+blocks:
+- name: rf_samp_rate
+  id: variable
+  parameters:
+    value: '240000'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [80, 60]
+    rotation: 0
+- name: audio_rate
+  id: variable
+  parameters:
+    value: '24000'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [80, 120]
+    rotation: 0
+- name: center_freq
+  id: variable
+  parameters:
+    value: '442.275e6'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [80, 180]
+    rotation: 0
+- name: ppm
+  id: variable
+  parameters:
+    value: '-41'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [80, 240]
+    rotation: 0
+- name: gain
+  id: variable
+  parameters:
+    value: '42'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [80, 300]
+    rotation: 0
+- name: fifo_path
+  id: variable
+  parameters:
+    value: '"runtime/grc_audio.pcm"'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [80, 360]
+    rotation: 0
+- name: audio_gain
+  id: variable
+  parameters:
+    value: '0.85'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [80, 420]
+    rotation: 0
+
+- name: osmosdr_source_0
+  id: osmosdr_source
+  parameters:
+    args: '"numchan=1"'
+    ant0: ''
+    bb_gain0: '20'
+    bw0: '0'
+    center_freq0: center_freq
+    corr0: ppm
+    dc_offset_mode0: '0'
+    freq_corr0: ppm
+    gain0: gain
+    gain_mode0: 'False'
+    if_gain0: '20'
+    iq_balance_mode0: '0'
+    nchan: '1'
+    sample_rate: rf_samp_rate
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [320, 120]
+    rotation: 0
+
+- name: qtgui_freq_sink_x_0
+  id: qtgui_freq_sink_x
+  parameters:
+    affinity: ''
+    alpha1: '1.0'
+    bw: rf_samp_rate
+    color1: blue
+    fc: center_freq
+    fftsize: '2048'
+    freqhalf: 'True'
+    grid: 'True'
+    gui_hint: ''
+    label1: RF Spectrum
+    legend: 'True'
+    name: '"RF Spectrum"'
+    nconnections: '1'
+    type: complex
+    update_time: '0.10'
+    wintype: window.WIN_BLACKMAN_hARRIS
+    ymax: '10'
+    ymin: '-140'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [720, 40]
+    rotation: 0
+
+- name: qtgui_waterfall_sink_x_0
+  id: qtgui_waterfall_sink_x
+  parameters:
+    affinity: ''
+    bw: rf_samp_rate
+    fc: center_freq
+    fftsize: '2048'
+    freqhalf: 'True'
+    grid: 'True'
+    gui_hint: ''
+    intensity: '0.6'
+    legend: 'True'
+    name: '"RF Waterfall"'
+    nconnections: '1'
+    type: complex
+    update_time: '0.10'
+    wintype: window.WIN_BLACKMAN_hARRIS
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [720, 180]
+    rotation: 0
+
+- name: analog_nbfm_rx_0
+  id: analog_nbfm_rx
+  parameters:
+    audio_rate: audio_rate
+    max_dev: '5000'
+    quad_rate: rf_samp_rate
+    tau: '75e-6'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [590, 430]
+    rotation: 0
+
+- name: blocks_multiply_const_vxx_0
+  id: blocks_multiply_const_vxx
+  parameters:
+    const: audio_gain
+    type: float
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [800, 450]
+    rotation: 0
+
+- name: audio_sink_0
+  id: audio_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    device_name: ''
+    num_inputs: '1'
+    ok_to_block: 'True'
+    samp_rate: audio_rate
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [1030, 390]
+    rotation: 0
+
+- name: blocks_float_to_short_0
+  id: blocks_float_to_short
+  parameters:
+    scale: '16000'
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [1030, 500]
+    rotation: 0
+
+- name: blocks_file_sink_0
+  id: blocks_file_sink
+  parameters:
+    append: 'False'
+    file: fifo_path
+    type: short
+    unbuffered: 'True'
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    coordinate: [1230, 500]
+    rotation: 0
+
+connections:
+- [osmosdr_source_0, '0', qtgui_freq_sink_x_0, '0']
+- [osmosdr_source_0, '0', qtgui_waterfall_sink_x_0, '0']
+- [osmosdr_source_0, '0', analog_nbfm_rx_0, '0']
+- [analog_nbfm_rx_0, '0', blocks_multiply_const_vxx_0, '0']
+- [blocks_multiply_const_vxx_0, '0', audio_sink_0, '0']
+- [blocks_multiply_const_vxx_0, '0', blocks_float_to_short_0, '0']
+- [blocks_float_to_short_0, '0', blocks_file_sink_0, '0']
+
+metadata:
+  file_format: 1
+  grc_version: 3.10.0.0
