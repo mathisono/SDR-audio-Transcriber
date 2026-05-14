@@ -5,8 +5,9 @@ Two operating profiles are supported:
 
   practice-text
     Best-effort Morse text decoding for ARRL/training/practice files. This mode
-    is allowed to return imperfect text, but it does not promote classifier label
-    candidates.
+    defaults to measured timing instead of a WPM prior because practice/Farnsworth
+    spacing often has a different character speed than word speed. It never
+    promotes classifier label candidates.
 
   repeater-id
     Conservative repeater/ham ID extraction. This mode still returns best-effort
@@ -160,8 +161,6 @@ def valid_callsign_candidate(callsign: str, symbols: str, text: str = "") -> boo
 def extract_callsigns(text: str, symbols: str = "", profile: str = "repeater-id") -> list[str]:
     compact = re.sub(r"[^A-Z0-9? ]", " ", (text or "").upper())
     if profile == "practice-text":
-        # Practice text may legitimately contain callsigns such as QST DE W1AW,
-        # but they are informational only and are not label candidates.
         no_unknowns = compact.replace("?", " ")
         return sorted(set(match.group(0).upper() for match in CALLSIGN_RE.finditer(no_unknowns)))
 
@@ -410,7 +409,6 @@ def score_decode(decoded: dict[str, Any], runs: list[tuple[bool, float]], duty_c
         if text and set(text.replace(" ", "")) <= {"T", "E"} and len(text.replace(" ", "")) > 8:
             score -= 3.0
     else:
-        # Practice text favors readable coverage over label-like fragments.
         score += len(LIKELY_ID_WORD_RE.findall(text)) * 0.10
     if duty_cycle < 0.02 or duty_cycle > 0.88:
         score -= 2.0
@@ -448,13 +446,15 @@ def decode_attempt(sample_rate: int, samples: list[float], tone: dict[str, Any],
     return attempt
 
 
-def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int = 10, smooth_frames: int = 0, expected_wpm_min: float = 8.0, expected_wpm_max: float = 30.0, use_wpm_prior: bool = True, char_gap_units: float = 2.25, word_gap_units: float = 5.50, label_min_confidence: float = 0.80, on_fraction: float = 0.55, off_fraction: float = 0.45, auto_tune: bool = True, max_attempts_reported: int = 8, profile: str = "repeater-id") -> dict[str, Any]:
+def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int = 10, smooth_frames: int = 0, expected_wpm_min: float = 8.0, expected_wpm_max: float = 30.0, use_wpm_prior: bool | None = None, char_gap_units: float = 2.25, word_gap_units: float = 5.50, label_min_confidence: float = 0.80, on_fraction: float = 0.55, off_fraction: float = 0.45, auto_tune: bool = True, max_attempts_reported: int = 8, profile: str = "repeater-id") -> dict[str, Any]:
     if profile not in PROFILE_CHOICES:
         raise ValueError(f"unknown CW profile: {profile}")
+    if use_wpm_prior is None:
+        use_wpm_prior = profile != "practice-text"
     sample_rate, samples = read_wav_mono(path)
     duration = len(samples) / sample_rate if sample_rate else 0.0
     tone = estimate_tone(sample_rate, samples, low_hz, high_hz)
-    result: dict[str, Any] = {"engine": "cw_decode_dsp_v5.3", "profile": profile, "file": path.name, "sample_rate": sample_rate, "duration_sec": round(duration, 3), "tone": tone, "decoded": False, "text": "", "callsigns": [], "confidence": 0.0}
+    result: dict[str, Any] = {"engine": "cw_decode_dsp_v5.4", "profile": profile, "use_wpm_prior": use_wpm_prior, "file": path.name, "sample_rate": sample_rate, "duration_sec": round(duration, 3), "tone": tone, "decoded": False, "text": "", "callsigns": [], "confidence": 0.0}
     if not tone.get("detected") or not tone.get("frequency_hz"):
         result["reason"] = tone.get("reason", "tone not detected")
         result["label_candidates"] = []
@@ -509,7 +509,7 @@ def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int
         result["label_candidates"] = []
     else:
         result["label_candidates"] = [
-            {"type": "cw_callsign", "label": callsign, "value": callsign, "confidence": result.get("confidence", 0.0), "source": "cw_decode_dsp_v5.3", "tone_hz": tone.get("frequency_hz"), "score": result.get("score", 0.0), "profile": profile}
+            {"type": "cw_callsign", "label": callsign, "value": callsign, "confidence": result.get("confidence", 0.0), "source": "cw_decode_dsp_v5.4", "tone_hz": tone.get("frequency_hz"), "score": result.get("score", 0.0), "profile": profile}
             for callsign in result.get("callsigns", [])
             if float(result.get("confidence", 0.0)) >= label_min_confidence and float(result.get("score", 0.0)) >= 7.0 and valid_callsign_candidate(callsign, result.get("symbols", ""), result.get("text", ""))
         ]
@@ -526,7 +526,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-frames", type=int, default=0)
     parser.add_argument("--expected-wpm-min", type=float, default=8.0)
     parser.add_argument("--expected-wpm-max", type=float, default=30.0)
-    parser.add_argument("--no-wpm-prior", action="store_true", help="Use only measured timing; do not pull dit timing toward expected WPM")
+    parser.add_argument("--wpm-prior", dest="wpm_prior", action="store_true", default=None, help="Force WPM-prior timing")
+    parser.add_argument("--no-wpm-prior", dest="wpm_prior", action="store_false", help="Use only measured timing; do not pull dit timing toward expected WPM")
     parser.add_argument("--char-gap-units", type=float, default=2.25)
     parser.add_argument("--word-gap-units", type=float, default=5.50)
     parser.add_argument("--on-fraction", type=float, default=0.55)
@@ -542,7 +543,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    result = decode_wav(args.wav, low_hz=args.low_hz, high_hz=args.high_hz, frame_ms=args.frame_ms, smooth_frames=args.smooth_frames, expected_wpm_min=args.expected_wpm_min, expected_wpm_max=args.expected_wpm_max, use_wpm_prior=not args.no_wpm_prior, char_gap_units=args.char_gap_units, word_gap_units=args.word_gap_units, label_min_confidence=args.label_min_confidence, on_fraction=args.on_fraction, off_fraction=args.off_fraction, auto_tune=args.auto_tune, max_attempts_reported=args.max_attempts_reported, profile=args.profile)
+    result = decode_wav(args.wav, low_hz=args.low_hz, high_hz=args.high_hz, frame_ms=args.frame_ms, smooth_frames=args.smooth_frames, expected_wpm_min=args.expected_wpm_min, expected_wpm_max=args.expected_wpm_max, use_wpm_prior=args.wpm_prior, char_gap_units=args.char_gap_units, word_gap_units=args.word_gap_units, label_min_confidence=args.label_min_confidence, on_fraction=args.on_fraction, off_fraction=args.off_fraction, auto_tune=args.auto_tune, max_attempts_reported=args.max_attempts_reported, profile=args.profile)
     if args.text_only:
         print(result.get("text", ""))
     else:
