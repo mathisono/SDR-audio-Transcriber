@@ -2,8 +2,9 @@
 """Classify SDR audio clips for repeater IDs and tone evidence.
 
 This optional classifier estimates a dominant audio tone, runs the internal
-one-shot DSP CW decoder, can run an optional external command-line CW decoder,
-and returns JSON evidence used to populate label candidates.
+one-shot DSP CW decoder in repeater-id profile, can run an optional external
+command-line CW decoder, and returns JSON evidence used to populate label
+candidates.
 
 The output is evidence, not final truth. Repeated evidence over time is handled
 by transcribe_worker.py and runtime/classification_state.json.
@@ -98,13 +99,14 @@ def classify_wav(
         frame_ms=frame_ms,
         expected_wpm_min=expected_wpm_min,
         expected_wpm_max=expected_wpm_max,
+        profile="repeater-id",
     )
     external = run_external_cw_decoder(path, external_command, external_timeout)
 
     tone = cw.get("tone") or {"detected": False}
     result: dict[str, Any] = {
         "enabled": True,
-        "engine": "clip_classifier_v2",
+        "engine": "clip_classifier_v3",
         "file": path.name,
         "sample_rate": sample_rate,
         "duration_sec": round(duration, 3),
@@ -119,6 +121,7 @@ def classify_wav(
         "cw_id": {
             "decoded": bool(cw.get("decoded")),
             "engine": cw.get("engine"),
+            "profile": cw.get("profile"),
             "text": cw.get("text", ""),
             "confidence": cw.get("confidence", 0.0),
             "callsigns": cw.get("callsigns", []),
