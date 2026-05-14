@@ -12,10 +12,9 @@ The v5 path tries several gate/smoothing/gap combinations and chooses the best
 scored decode. This is more reliable for short/noisy repeater IDs than a single
 fixed threshold.
 
-Important: clean Morse practice files made mostly of E/I/S/H/5 can decode into
-callsign-looking strings such as EE5EHS. This script now blocks those as label
-candidates unless the symbol stream has enough dah/dash content to look like a
-real callsign-bearing ID.
+Important: clean Morse practice files can decode into callsign-looking fragments.
+This script only promotes CW callsign label candidates when the callsign appears
+as a clean contiguous token in the decoded text and the decode has enough quality.
 """
 from __future__ import annotations
 
@@ -128,15 +127,31 @@ def symbol_stats(symbols: str) -> dict[str, Any]:
     }
 
 
-def valid_callsign_candidate(callsign: str, symbols: str) -> bool:
+def clean_tokens(text: str) -> list[str]:
+    return [token for token in re.split(r"\s+", (text or "").upper().strip()) if token]
+
+
+def clean_callsign_in_text(callsign: str, text: str) -> bool:
+    """Require a clean contiguous callsign token, not one reconstructed through ? gaps."""
+    callsign = callsign.upper()
+    for token in clean_tokens(text):
+        if "?" in token:
+            continue
+        normalized = re.sub(r"[^A-Z0-9]", "", token)
+        if normalized == callsign:
+            return True
+    return False
+
+
+def valid_callsign_candidate(callsign: str, symbols: str, text: str = "") -> bool:
     callsign = callsign.upper().strip()
     if not CALLSIGN_RE.fullmatch(callsign):
         return False
+    if text and not clean_callsign_in_text(callsign, text):
+        return False
     stats = symbol_stats(symbols)
-    # Block false callsigns from dot-heavy practice audio such as E/I/S/H/5 drills.
     if stats["mark_count"] >= 12 and stats["dash_count"] < 2:
         return False
-    # Avoid highly repetitive fake labels like EE5EHS / EE5EHEE.
     letters = callsign.replace("0", "O")
     if len(set(letters)) <= 3 and not any(ch in letters for ch in "AKNW"):
         return False
@@ -144,11 +159,14 @@ def valid_callsign_candidate(callsign: str, symbols: str) -> bool:
 
 
 def extract_callsigns(text: str, symbols: str = "") -> list[str]:
-    compact = re.sub(r"[^A-Z0-9 ]", " ", (text or "").upper())
-    direct = {match.group(0).upper() for match in CALLSIGN_RE.finditer(compact)}
-    squashed = re.sub(r"\s+", "", compact)
-    direct.update(match.group(0).upper() for match in CALLSIGN_RE.finditer(squashed))
-    return sorted(callsign for callsign in direct if valid_callsign_candidate(callsign, symbols))
+    compact = re.sub(r"[^A-Z0-9? ]", " ", (text or "").upper())
+    direct = {match.group(0).upper() for match in CALLSIGN_RE.finditer(compact.replace("?", " "))}
+    # Only squashed fallback when there are no unknown markers. Unknowns mean the
+    # text is too damaged to safely reconstruct a callsign label.
+    if "?" not in compact:
+        squashed = re.sub(r"\s+", "", compact)
+        direct.update(match.group(0).upper() for match in CALLSIGN_RE.finditer(squashed))
+    return sorted(callsign for callsign in direct if valid_callsign_candidate(callsign, symbols, text))
 
 
 def estimate_tone(sample_rate: int, samples: list[float], low_hz: int, high_hz: int) -> dict[str, Any]:
@@ -422,11 +440,11 @@ def decode_attempt(sample_rate: int, samples: list[float], tone: dict[str, Any],
     return attempt
 
 
-def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int = 10, smooth_frames: int = 0, expected_wpm_min: float = 8.0, expected_wpm_max: float = 30.0, use_wpm_prior: bool = True, char_gap_units: float = 2.25, word_gap_units: float = 5.50, label_min_confidence: float = 0.72, on_fraction: float = 0.55, off_fraction: float = 0.45, auto_tune: bool = True, max_attempts_reported: int = 8) -> dict[str, Any]:
+def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int = 10, smooth_frames: int = 0, expected_wpm_min: float = 8.0, expected_wpm_max: float = 30.0, use_wpm_prior: bool = True, char_gap_units: float = 2.25, word_gap_units: float = 5.50, label_min_confidence: float = 0.80, on_fraction: float = 0.55, off_fraction: float = 0.45, auto_tune: bool = True, max_attempts_reported: int = 8) -> dict[str, Any]:
     sample_rate, samples = read_wav_mono(path)
     duration = len(samples) / sample_rate if sample_rate else 0.0
     tone = estimate_tone(sample_rate, samples, low_hz, high_hz)
-    result: dict[str, Any] = {"engine": "cw_decode_dsp_v5.1", "file": path.name, "sample_rate": sample_rate, "duration_sec": round(duration, 3), "tone": tone, "decoded": False, "text": "", "callsigns": [], "confidence": 0.0}
+    result: dict[str, Any] = {"engine": "cw_decode_dsp_v5.2", "file": path.name, "sample_rate": sample_rate, "duration_sec": round(duration, 3), "tone": tone, "decoded": False, "text": "", "callsigns": [], "confidence": 0.0}
     if not tone.get("detected") or not tone.get("frequency_hz"):
         result["reason"] = tone.get("reason", "tone not detected")
         return result
@@ -476,9 +494,9 @@ def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int
     if not result["decoded"]:
         result["reason"] = best.get("reason", "decode failed")
     result["label_candidates"] = [
-        {"type": "cw_callsign", "label": callsign, "value": callsign, "confidence": result.get("confidence", 0.0), "source": "cw_decode_dsp_v5.1", "tone_hz": tone.get("frequency_hz"), "score": result.get("score", 0.0)}
+        {"type": "cw_callsign", "label": callsign, "value": callsign, "confidence": result.get("confidence", 0.0), "source": "cw_decode_dsp_v5.2", "tone_hz": tone.get("frequency_hz"), "score": result.get("score", 0.0)}
         for callsign in result.get("callsigns", [])
-        if float(result.get("confidence", 0.0)) >= label_min_confidence and valid_callsign_candidate(callsign, result.get("symbols", ""))
+        if float(result.get("confidence", 0.0)) >= label_min_confidence and float(result.get("score", 0.0)) >= 7.0 and valid_callsign_candidate(callsign, result.get("symbols", ""), result.get("text", ""))
     ]
     return result
 
@@ -497,7 +515,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--word-gap-units", type=float, default=5.50)
     parser.add_argument("--on-fraction", type=float, default=0.55)
     parser.add_argument("--off-fraction", type=float, default=0.45)
-    parser.add_argument("--label-min-confidence", type=float, default=0.72)
+    parser.add_argument("--label-min-confidence", type=float, default=0.80)
     parser.add_argument("--auto-tune", dest="auto_tune", action="store_true", default=True, help="Try multiple gate/timing settings and pick the best decode. Default: enabled")
     parser.add_argument("--no-auto-tune", dest="auto_tune", action="store_false", help="Use only the exact gate/timing settings supplied")
     parser.add_argument("--max-attempts-reported", type=int, default=8)
