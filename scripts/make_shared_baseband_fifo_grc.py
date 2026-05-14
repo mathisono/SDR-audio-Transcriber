@@ -138,7 +138,7 @@ def nbfm_block() -> str:
             "max_dev": "'5000'",
             "maxoutbuf": "'0'",
             "minoutbuf": "'0'",
-            "quad_rate": "samp_rate/chan1_decim",
+            "quad_rate": "int(samp_rate/chan1_decim)",
             "tau": "'75e-6'",
         },
         "[1016, 620]",
