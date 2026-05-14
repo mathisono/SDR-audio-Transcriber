@@ -25,6 +25,7 @@ import requests
 from faster_whisper import WhisperModel
 
 CALLSIGN_RE = re.compile(r"\b(?:[AKNW][A-Z]?\d[A-Z]{1,3}|[A-Z]{1,2}\d[A-Z]{1,4})\b", re.IGNORECASE)
+CLEANUP_MODES = ["plain", "radio-log", "conservative"]
 
 
 def utc_iso() -> str:
@@ -79,31 +80,126 @@ def rebuild_page(transcripts_dir: Path) -> None:
     )
 
 
-def call_cleanup_model(text: str, base_url: str, model: str, timeout: int) -> str:
-    prompt = f"""
-Clean up this radio transcription.
+def format_frequency(value: object) -> str:
+    try:
+        hz = int(float(value))
+    except (TypeError, ValueError):
+        return str(value or "unknown")
+    if hz >= 1_000_000:
+        return f"{hz / 1_000_000:.6f} MHz"
+    if hz >= 1_000:
+        return f"{hz / 1_000:.3f} kHz"
+    return f"{hz} Hz"
 
-Rules:
-- Preserve callsigns, names, frequencies, and technical terms.
-- Do not invent missing words.
-- If uncertain, mark the word or phrase as [unclear].
-- Remove obvious repeated filler caused by radio noise.
-- Return only the cleaned transcript.
 
-Raw transcript:
-{text}
+def metadata_summary(metadata: dict[str, Any], classification: dict[str, Any] | None = None) -> dict[str, Any]:
+    classification = classification or {}
+    summary: dict[str, Any] = {
+        "source": metadata.get("source"),
+        "receiver": metadata.get("receiver"),
+        "frequency": metadata.get("frequency_label") or format_frequency(metadata.get("frequency_hz")),
+        "mode": metadata.get("mode"),
+        "started_utc": metadata.get("started_utc"),
+        "duration_sec": metadata.get("duration_sec"),
+    }
+    label_candidates = classification.get("label_candidates") or []
+    if label_candidates:
+        summary["label_candidates"] = [
+            {
+                "label": item.get("label"),
+                "type": item.get("type"),
+                "confidence": item.get("confidence"),
+                "source": item.get("source"),
+            }
+            for item in label_candidates[:5]
+        ]
+    tone = (classification.get("classification") or classification).get("tone_id") if isinstance(classification, dict) else None
+    cw = (classification.get("classification") or classification).get("cw_id") if isinstance(classification, dict) else None
+    if tone:
+        summary["tone_id"] = tone
+    if cw:
+        summary["cw_id"] = cw
+    return {k: v for k, v in summary.items() if v not in (None, "", [])}
+
+
+def cleanup_prompt(text: str, mode: str, metadata: dict[str, Any], classification: dict[str, Any] | None = None) -> str:
+    context = metadata_summary(metadata, classification)
+    raw = text.strip()
+
+    common_rules = """
+Core rules:
+- Preserve callsigns, names, frequencies, numbers, radio terms, and technical wording.
+- Do not invent missing words, speakers, locations, callsigns, or agencies.
+- If a word/phrase is uncertain, mark it as [unclear].
+- If the clip is mostly noise, tones, silence, or ASR garbage, say: [no reliable speech detected]
+- Remove obvious ASR filler/repetition caused by radio noise.
+- Return only the cleaned output; do not explain your process.
 """.strip()
+
+    if mode == "plain":
+        task = """
+Task: Clean this single radio transcription into readable text.
+Use normal punctuation and capitalization. Keep it as one short paragraph unless the source clearly contains multiple transmissions.
+""".strip()
+    elif mode == "radio-log":
+        task = """
+Task: Format this single clip as a compact radio log entry.
+Preferred output format:
+[station/label or unknown] — cleaned transmission text
+Notes: short uncertainty note only if needed.
+
+Do not add timestamp/frequency unless the transmission text itself needs it; the web page already displays metadata.
+If the text is fragmentary, preserve the fragment but mark uncertain pieces.
+""".strip()
+    elif mode == "conservative":
+        task = """
+Task: Produce a conservative copy-edit only.
+Make the smallest possible changes to punctuation/capitalization.
+Do not reorganize the text.
+Do not turn fragments into complete sentences unless the words are clearly present.
+Use [unclear] aggressively for questionable words.
+""".strip()
+    else:
+        raise ValueError(f"unknown cleanup mode: {mode}")
+
+    return f"""
+You are cleaning a short SDR/radio speech-to-text clip.
+
+{task}
+
+{common_rules}
+
+Clip metadata / classifier context:
+{json.dumps(context, indent=2, ensure_ascii=False)}
+
+Raw Whisper transcript:
+{raw}
+""".strip()
+
+
+def call_cleanup_model(
+    text: str,
+    base_url: str,
+    model: str,
+    timeout: int,
+    mode: str = "radio-log",
+    metadata: dict[str, Any] | None = None,
+    classification: dict[str, Any] | None = None,
+    max_tokens: int = 512,
+) -> str:
+    prompt = cleanup_prompt(text, mode, metadata or {}, classification)
 
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "system",
-                "content": "You clean up SDR/radio speech-to-text transcripts without inventing details.",
+                "content": "You clean up SDR/radio speech-to-text transcripts conservatively. You never invent details. You preserve uncertainty, callsigns, frequencies, and radio terminology.",
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.1,
+        "temperature": 0.05,
+        "max_tokens": max_tokens,
     }
 
     response = requests.post(
@@ -111,7 +207,8 @@ Raw transcript:
         json=payload,
         timeout=timeout,
     )
-    response.raise_for_status()
+    if response.status_code >= 400:
+        raise RuntimeError(f"cleanup model failed: HTTP {response.status_code} {response.reason}: {response.text[:2000]}")
     return response.json()["choices"][0]["message"]["content"].strip()
 
 
@@ -373,6 +470,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lmstudio-port", type=int, default=1234, help="LM Studio server port")
     parser.add_argument("--lmstudio-url", default=None, help="Full OpenAI-compatible base URL, for example http://192.168.3.28:1234/v1")
     parser.add_argument("--cleanup-model", default="bingbangboom/Qwen3508B-transcriber-15k-03")
+    parser.add_argument("--cleanup-mode", choices=CLEANUP_MODES, default="radio-log", help="Qwen cleanup style")
+    parser.add_argument("--cleanup-max-tokens", type=int, default=512, help="Max tokens for per-clip cleanup")
     parser.add_argument("--cleanup-timeout", type=int, default=120)
     parser.add_argument("--no-cleanup", action="store_true", help="Skip local LLM cleanup step")
     parser.add_argument("--enable-classifier", action="store_true", help="Enable CW/tone/spoken callsign label candidates")
@@ -410,7 +509,7 @@ def main() -> int:
     if args.no_cleanup:
         print("worker: cleanup disabled", flush=True)
     else:
-        print(f"worker: cleanup endpoint {lmstudio_url} model={args.cleanup_model}", flush=True)
+        print(f"worker: cleanup endpoint {lmstudio_url} model={args.cleanup_model} mode={args.cleanup_mode}", flush=True)
     if args.enable_classifier:
         print(f"worker: classifier enabled state={classification_state_path}", flush=True)
         if args.cw_external_command:
@@ -434,6 +533,10 @@ def main() -> int:
             print(f"worker: transcribing {proc.name}", flush=True)
             raw_text, segments, info = transcribe_file(whisper, proc)
 
+            classification: dict[str, Any] = {"enabled": False, "label_candidates": []}
+            if args.enable_classifier:
+                classification = run_clip_classifier(proc, args.cw_external_command, args.cw_external_timeout)
+
             cleanup_error = None
             if args.no_cleanup or not raw_text:
                 clean_text = raw_text
@@ -444,14 +547,14 @@ def main() -> int:
                         lmstudio_url,
                         args.cleanup_model,
                         args.cleanup_timeout,
+                        mode=args.cleanup_mode,
+                        metadata=sidecar_metadata,
+                        classification=classification,
+                        max_tokens=args.cleanup_max_tokens,
                     )
                 except Exception as exc:
                     cleanup_error = str(exc)
                     clean_text = raw_text
-
-            classification: dict[str, Any] = {"enabled": False, "label_candidates": []}
-            if args.enable_classifier:
-                classification = run_clip_classifier(proc, args.cw_external_command, args.cw_external_timeout)
 
             spoken_candidates = spoken_callsign_candidates(raw_text, clean_text)
             label_candidates = merge_label_candidates(
@@ -473,6 +576,7 @@ def main() -> int:
                 "segments": segments,
                 "cleanup_model": None if args.no_cleanup else args.cleanup_model,
                 "cleanup_endpoint": None if args.no_cleanup else lmstudio_url,
+                "cleanup_mode": None if args.no_cleanup else args.cleanup_mode,
                 "cleanup_error": cleanup_error,
                 "classification": classification,
                 "label_candidates": label_candidates,
