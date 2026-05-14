@@ -6,13 +6,18 @@ audio. It is not a full contest-grade CW skimmer. It favors robust, explainable
 DSP over a black-box model:
 
   WAV -> mono PCM -> tone search -> Goertzel envelope -> adaptive gate -> timing
-  estimate -> Morse decode -> callsign-biased candidates
+  estimate -> multi-attempt Morse decode -> callsign-biased candidates
+
+The v5 path tries several gate/smoothing/gap combinations and chooses the best
+scored decode. This is more reliable for short/noisy repeater IDs than a single
+fixed threshold.
 
 Examples:
   scripts/cw_decode.py clip.wav
   scripts/cw_decode.py clip.wav --pretty
   scripts/cw_decode.py clip.wav --text-only
   scripts/cw_decode.py clip.wav --expected-wpm-min 8 --expected-wpm-max 25
+  scripts/cw_decode.py clip.wav --auto-tune --pretty
 """
 from __future__ import annotations
 
@@ -38,6 +43,7 @@ MORSE_TABLE = {
 }
 
 CALLSIGN_RE = re.compile(r"\b(?:[AKNW][A-Z]?\d[A-Z]{1,3}|[A-Z]{1,2}\d[A-Z]{1,4})\b", re.IGNORECASE)
+LIKELY_ID_WORD_RE = re.compile(r"\b(?:DE|ID|RPT|REPEATER|TEST)\b", re.IGNORECASE)
 
 
 def read_wav_mono(path: Path) -> tuple[int, list[float]]:
@@ -83,6 +89,9 @@ def moving_average(values: list[float], radius: int) -> list[float]:
     if radius <= 0 or not values:
         return values[:]
     out: list[float] = []
+    running = 0.0
+    counts = 0
+    # Simple implementation is fine here; clips are short.
     for i in range(len(values)):
         lo = max(0, i - radius)
         hi = min(len(values), i + radius + 1)
@@ -90,12 +99,27 @@ def moving_average(values: list[float], radius: int) -> list[float]:
     return out
 
 
+def median_filter(values: list[float], radius: int) -> list[float]:
+    if radius <= 0 or not values:
+        return values[:]
+    out: list[float] = []
+    for i in range(len(values)):
+        lo = max(0, i - radius)
+        hi = min(len(values), i + radius + 1)
+        out.append(statistics.median(values[lo:hi]))
+    return out
+
+
 def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
-    idx = int(round((len(ordered) - 1) * pct))
-    return ordered[max(0, min(len(ordered) - 1, idx))]
+    pos = (len(ordered) - 1) * pct
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return ordered[int(pos)]
+    return ordered[lo] * (hi - pos) + ordered[hi] * (pos - lo)
 
 
 def estimate_tone(sample_rate: int, samples: list[float], low_hz: int, high_hz: int) -> dict[str, Any]:
@@ -109,21 +133,22 @@ def estimate_tone(sample_rate: int, samples: list[float], low_hz: int, high_hz: 
     best_freq = coarse_powers[0][0]
     floor = statistics.median([p for _, p in coarse_powers]) or 1.0
 
-    fine = list(range(max(low_hz, best_freq - 35), min(high_hz, best_freq + 35) + 1, 5))
+    fine = list(range(max(low_hz, best_freq - 45), min(high_hz, best_freq + 45) + 1, 5))
     fine_powers = [(freq, goertzel_power(window, sample_rate, freq)) for freq in fine]
     fine_powers.sort(key=lambda item: item[1], reverse=True)
     freq, power = fine_powers[0]
     ratio = power / floor
 
     return {
-        "detected": ratio >= 7.0,
+        "detected": ratio >= 5.0,
         "frequency_hz": int(freq),
         "power_ratio": round(ratio, 3),
         "confidence": round(max(0.0, min(1.0, math.log10(max(ratio, 1.0)) / 2.0)), 3),
+        "top_frequencies": [{"frequency_hz": int(f), "relative_power": round(p / floor, 3)} for f, p in fine_powers[:5]],
     }
 
 
-def tone_envelope(sample_rate: int, samples: list[float], freq_hz: float, frame_ms: int, smooth_frames: int) -> list[tuple[float, float]]:
+def tone_envelope(sample_rate: int, samples: list[float], freq_hz: float, frame_ms: int, smooth_frames: int, median_frames: int = 0) -> list[tuple[float, float]]:
     frame_len = max(1, int(sample_rate * frame_ms / 1000.0))
     times: list[float] = []
     powers: list[float] = []
@@ -131,7 +156,8 @@ def tone_envelope(sample_rate: int, samples: list[float], freq_hz: float, frame_
         frame = samples[start:start + frame_len]
         powers.append(math.sqrt(goertzel_power(frame, sample_rate, freq_hz)))
         times.append(start / sample_rate)
-    smoothed = moving_average(powers, smooth_frames)
+    filtered = median_filter(powers, median_frames)
+    smoothed = moving_average(filtered, smooth_frames)
     return list(zip(times, smoothed))
 
 
@@ -140,7 +166,11 @@ def activity_from_envelope(envelope: list[tuple[float, float]], on_fraction: flo
     if not values:
         return [], {"threshold": 0.0}
     noise = percentile(values, 0.20)
-    high = percentile(values, 0.90)
+    mid = percentile(values, 0.50)
+    high = percentile(values, 0.92)
+    # If high and noise collapse together, there is no useful gate.
+    if high <= noise * 1.05:
+        return [False for _ in values], {"noise_floor": round(noise, 6), "high_level": round(high, 6), "reason": "no envelope contrast"}
     on_threshold = noise + (high - noise) * on_fraction
     off_threshold = noise + (high - noise) * off_fraction
     active = False
@@ -153,33 +183,13 @@ def activity_from_envelope(envelope: list[tuple[float, float]], on_fraction: flo
         activity.append(active)
     return activity, {
         "noise_floor": round(noise, 6),
+        "median_level": round(mid, 6),
         "high_level": round(high, 6),
         "on_fraction": on_fraction,
         "off_fraction": off_fraction,
         "on_threshold": round(on_threshold, 6),
         "off_threshold": round(off_threshold, 6),
     }
-
-
-def runs_from_activity(activity: list[bool], frame_ms: int) -> list[tuple[bool, float]]:
-    if not activity:
-        return []
-    runs: list[tuple[bool, float]] = []
-    current = activity[0]
-    count = 0
-    for state in activity:
-        if state == current:
-            count += 1
-        else:
-            duration = count * frame_ms / 1000.0
-            if duration >= frame_ms / 1000.0:
-                runs.append((current, duration))
-            current = state
-            count = 1
-    duration = count * frame_ms / 1000.0
-    if duration >= frame_ms / 1000.0:
-        runs.append((current, duration))
-    return merge_short_runs(runs, min_duration=frame_ms / 1000.0 * 1.1)
 
 
 def merge_short_runs(runs: list[tuple[bool, float]], min_duration: float) -> list[tuple[bool, float]]:
@@ -205,8 +215,58 @@ def merge_short_runs(runs: list[tuple[bool, float]], min_duration: float) -> lis
     return result
 
 
+def runs_from_activity(activity: list[bool], frame_ms: int, glitch_frames: int = 1) -> list[tuple[bool, float]]:
+    if not activity:
+        return []
+    runs: list[tuple[bool, float]] = []
+    current = activity[0]
+    count = 0
+    for state in activity:
+        if state == current:
+            count += 1
+        else:
+            runs.append((current, count * frame_ms / 1000.0))
+            current = state
+            count = 1
+    runs.append((current, count * frame_ms / 1000.0))
+    return merge_short_runs(runs, min_duration=(frame_ms / 1000.0) * max(1.1, glitch_frames + 0.1))
+
+
 def dit_from_wpm(wpm: float) -> float:
     return 1.2 / wpm
+
+
+def cluster_dit_from_on_runs(on: list[float], min_dit: float, max_dit: float) -> float:
+    """Estimate dit from on-runs using dot/dash ratio candidates.
+
+    A short CW sample can have few dots. The old decoder took the shortest 20%,
+    which often failed when the gate split a dash or stretched a dot. This tries
+    candidate dit lengths and scores how well key-down runs fit 1 or 3 units.
+    """
+    if not on:
+        return max_dit
+    lo = max(min(on) * 0.60, min_dit * 0.60)
+    hi = min(max_dit * 1.60, max(min(on) * 2.2, min(max(on), max_dit * 1.6)))
+    if hi <= lo:
+        return max(min_dit, min(max_dit, min(on)))
+    best_dit = lo
+    best_score = float("inf")
+    steps = 80
+    for i in range(steps + 1):
+        dit = lo + (hi - lo) * i / steps
+        score = 0.0
+        for duration in on:
+            units = duration / dit
+            target = 1.0 if units < 2.1 else 3.0
+            score += min(abs(units - target), 2.0)
+        score /= len(on)
+        # Prefer candidates that keep dots/dashes within expected WPM bounds.
+        if min_dit <= dit <= max_dit:
+            score *= 0.90
+        if score < best_score:
+            best_score = score
+            best_dit = dit
+    return max(min_dit * 0.60, min(max_dit * 1.60, best_dit))
 
 
 def estimate_dit(runs: list[tuple[bool, float]], wpm_min: float, wpm_max: float, use_wpm_prior: bool) -> dict[str, Any]:
@@ -218,22 +278,19 @@ def estimate_dit(runs: list[tuple[bool, float]], wpm_min: float, wpm_max: float,
     max_dit = dit_from_wpm(wpm_min)
     prior_wpm = (wpm_min + wpm_max) / 2.0
     prior_dit = dit_from_wpm(prior_wpm)
+    measured_dit = cluster_dit_from_on_runs(on, min_dit, max_dit)
 
-    candidates = [d for d in on if min_dit * 0.50 <= d <= max_dit * 1.50]
-    if not candidates:
-        candidates = on
-    candidates.sort()
-
-    dot_cluster = candidates[: max(1, math.ceil(len(candidates) * 0.20))]
-    measured_dit = percentile(dot_cluster, 0.10)
-    measured_dit = max(min_dit * 0.50, min(max_dit * 1.50, measured_dit))
-
-    if use_wpm_prior and measured_dit > prior_dit * 1.15:
-        dit = prior_dit
-        source = "wpm_prior"
+    if use_wpm_prior:
+        # Blend, but do not let the prior completely override good measured data.
+        if measured_dit < min_dit or measured_dit > max_dit:
+            dit = prior_dit
+            source = "wpm_prior_out_of_range"
+        else:
+            dit = (measured_dit * 0.70) + (prior_dit * 0.30)
+            source = "measured_prior_blend"
     else:
         dit = measured_dit
-        source = "measured"
+        source = "measured_cluster"
 
     wpm = 1.2 / dit if dit else 0.0
     return {
@@ -255,7 +312,7 @@ def decode_runs(runs: list[tuple[bool, float]], dit: float, char_gap_units: floa
     for active, duration in runs:
         units = duration / dit if dit else 0
         if active:
-            current += "." if units < 2.20 else "-"
+            current += "." if units < 2.15 else "-"
         else:
             if units >= word_gap_units:
                 if current:
@@ -266,8 +323,6 @@ def decode_runs(runs: list[tuple[bool, float]], dit: float, char_gap_units: floa
                 if current:
                     symbols.append(current)
                     current = ""
-            else:
-                pass
     if current:
         symbols.append(current)
 
@@ -277,7 +332,7 @@ def decode_runs(runs: list[tuple[bool, float]], dit: float, char_gap_units: floa
     non_space = sum(1 for c in decoded_chars if c != " ") or 1
     base_confidence = good / non_space
     callsigns = extract_callsigns(text)
-    confidence = min(0.99, base_confidence + 0.08) if callsigns and base_confidence >= 0.70 else base_confidence
+    confidence = min(0.99, base_confidence + 0.10) if callsigns and base_confidence >= 0.60 else base_confidence
     return {
         "decoded": bool(text),
         "symbols": " ".join(symbols),
@@ -292,7 +347,98 @@ def decode_runs(runs: list[tuple[bool, float]], dit: float, char_gap_units: floa
 
 
 def extract_callsigns(text: str) -> list[str]:
-    return sorted(set(match.group(0).upper() for match in CALLSIGN_RE.finditer(text or "")))
+    compact = re.sub(r"[^A-Z0-9 ]", " ", (text or "").upper())
+    direct = {match.group(0).upper() for match in CALLSIGN_RE.finditer(compact)}
+    # Also try compacting spaces around likely fragmented CW letters.
+    squashed = re.sub(r"\s+", "", compact)
+    direct.update(match.group(0).upper() for match in CALLSIGN_RE.finditer(squashed))
+    return sorted(direct)
+
+
+def score_decode(decoded: dict[str, Any], runs: list[tuple[bool, float]], duty_cycle: float, tone_confidence: float) -> float:
+    text = decoded.get("text") or ""
+    symbols = decoded.get("symbols") or ""
+    callsigns = decoded.get("callsigns") or []
+    unknown = int(decoded.get("unknown_symbols", 0) or 0)
+    confidence = float(decoded.get("confidence", 0.0) or 0.0)
+    non_space_len = len(re.sub(r"\s+", "", text))
+    dash_heavy_penalty = 0.0
+    if symbols:
+        marks = symbols.replace(" ", "").replace("/", "")
+        if marks:
+            dash_ratio = marks.count("-") / len(marks)
+            if dash_ratio > 0.82:
+                dash_heavy_penalty = (dash_ratio - 0.82) * 2.0
+    score = 0.0
+    score += confidence * 4.0
+    score += min(non_space_len, 20) * 0.08
+    score += len(callsigns) * 2.5
+    score += len(LIKELY_ID_WORD_RE.findall(text)) * 0.25
+    score += min(len(runs), 80) * 0.01
+    score += tone_confidence * 0.5
+    score -= unknown * 0.35
+    score -= dash_heavy_penalty
+    if duty_cycle < 0.02 or duty_cycle > 0.88:
+        score -= 2.0
+    if text and set(text.replace(" ", "")) <= {"T", "E"} and len(text.replace(" ", "")) > 8:
+        score -= 3.0
+    return round(score, 4)
+
+
+def decode_attempt(
+    sample_rate: int,
+    samples: list[float],
+    tone: dict[str, Any],
+    frame_ms: int,
+    smooth_frames: int,
+    median_frames: int,
+    on_fraction: float,
+    off_fraction: float,
+    expected_wpm_min: float,
+    expected_wpm_max: float,
+    use_wpm_prior: bool,
+    char_gap_units: float,
+    word_gap_units: float,
+) -> dict[str, Any]:
+    envelope = tone_envelope(sample_rate, samples, float(tone["frequency_hz"]), frame_ms, smooth_frames, median_frames)
+    activity, threshold = activity_from_envelope(envelope, on_fraction, off_fraction)
+    runs = runs_from_activity(activity, frame_ms, glitch_frames=max(1, smooth_frames))
+    active_time = sum(duration for active, duration in runs if active)
+    total_time = sum(duration for _, duration in runs) or 1.0
+    duty_cycle = active_time / total_time
+    keyed_candidate = 0.02 < duty_cycle < 0.88 and len(runs) >= 5
+    attempt: dict[str, Any] = {
+        "params": {
+            "frame_ms": frame_ms,
+            "smooth_frames": smooth_frames,
+            "median_frames": median_frames,
+            "on_fraction": on_fraction,
+            "off_fraction": off_fraction,
+            "char_gap_units": char_gap_units,
+            "word_gap_units": word_gap_units,
+        },
+        "threshold": threshold,
+        "duty_cycle": round(duty_cycle, 3),
+        "keyed_candidate": keyed_candidate,
+        "run_count": len(runs),
+        "runs": [{"active": active, "duration": round(duration, 4)} for active, duration in runs[:180]],
+    }
+    if not keyed_candidate:
+        attempt["decoded"] = False
+        attempt["reason"] = "tone is not keyed like CW"
+        attempt["score"] = -5.0
+        return attempt
+    timing = estimate_dit(runs, expected_wpm_min, expected_wpm_max, use_wpm_prior)
+    attempt["timing"] = timing
+    if not timing.get("ok"):
+        attempt["decoded"] = False
+        attempt["reason"] = timing.get("reason", "timing failed")
+        attempt["score"] = -4.0
+        return attempt
+    decoded = decode_runs(runs, float(timing["dit_seconds"]), char_gap_units, word_gap_units)
+    attempt.update(decoded)
+    attempt["score"] = score_decode(decoded, runs, duty_cycle, float(tone.get("confidence", 0.0) or 0.0))
+    return attempt
 
 
 def decode_wav(
@@ -309,12 +455,14 @@ def decode_wav(
     label_min_confidence: float = 0.72,
     on_fraction: float = 0.55,
     off_fraction: float = 0.45,
+    auto_tune: bool = True,
+    max_attempts_reported: int = 8,
 ) -> dict[str, Any]:
     sample_rate, samples = read_wav_mono(path)
     duration = len(samples) / sample_rate if sample_rate else 0.0
     tone = estimate_tone(sample_rate, samples, low_hz, high_hz)
     result: dict[str, Any] = {
-        "engine": "cw_decode_dsp_v4",
+        "engine": "cw_decode_dsp_v5",
         "file": path.name,
         "sample_rate": sample_rate,
         "duration_sec": round(duration, 3),
@@ -328,38 +476,58 @@ def decode_wav(
         result["reason"] = tone.get("reason", "tone not detected")
         return result
 
-    envelope = tone_envelope(sample_rate, samples, float(tone["frequency_hz"]), frame_ms, smooth_frames)
-    activity, threshold = activity_from_envelope(envelope, on_fraction, off_fraction)
-    runs = runs_from_activity(activity, frame_ms)
-    active_time = sum(duration for active, duration in runs if active)
-    total_time = sum(duration for _, duration in runs) or 1.0
-    duty_cycle = active_time / total_time
+    if auto_tune:
+        frame_values = sorted(set([frame_ms, 8, 10, 12, 15]))
+        smooth_values = sorted(set([smooth_frames, 0, 1, 2, 3]))
+        gate_values = [(0.48, 0.38), (0.55, 0.45), (0.62, 0.50), (0.70, 0.58)]
+        gap_values = [(2.0, 5.0), (2.25, 5.5), (2.7, 6.3), (3.0, 7.0)]
+    else:
+        frame_values = [frame_ms]
+        smooth_values = [smooth_frames]
+        gate_values = [(on_fraction, off_fraction)]
+        gap_values = [(char_gap_units, word_gap_units)]
 
-    result["threshold"] = threshold
-    result["frame_ms"] = frame_ms
-    result["smooth_frames"] = smooth_frames
-    result["runs"] = [{"active": active, "duration": round(duration, 4)} for active, duration in runs[:180]]
-    result["duty_cycle"] = round(duty_cycle, 3)
-    result["keyed_candidate"] = 0.02 < duty_cycle < 0.88 and len(runs) >= 5
-    if not result["keyed_candidate"]:
-        result["reason"] = "tone is not keyed like CW"
-        return result
+    attempts: list[dict[str, Any]] = []
+    for fm in frame_values:
+        for sm in smooth_values:
+            for onf, offf in gate_values:
+                if offf >= onf:
+                    continue
+                for cgap, wgap in gap_values:
+                    attempts.append(decode_attempt(sample_rate, samples, tone, fm, sm, 0, onf, offf, expected_wpm_min, expected_wpm_max, use_wpm_prior, cgap, wgap))
 
-    timing = estimate_dit(runs, expected_wpm_min, expected_wpm_max, use_wpm_prior)
-    result["timing"] = timing
-    if not timing.get("ok"):
-        result["reason"] = timing.get("reason", "timing failed")
-        return result
+    attempts.sort(key=lambda item: float(item.get("score", -999.0)), reverse=True)
+    best = attempts[0] if attempts else {"decoded": False, "reason": "no attempts"}
+    result["attempt_count"] = len(attempts)
+    result["best_attempt"] = {k: v for k, v in best.items() if k != "runs"}
+    result["attempts"] = [{k: v for k, v in attempt.items() if k != "runs"} for attempt in attempts[:max_attempts_reported]]
+    result["runs"] = best.get("runs", [])
+    result["threshold"] = best.get("threshold", {})
+    result["frame_ms"] = best.get("params", {}).get("frame_ms", frame_ms)
+    result["smooth_frames"] = best.get("params", {}).get("smooth_frames", smooth_frames)
+    result["duty_cycle"] = best.get("duty_cycle", 0.0)
+    result["keyed_candidate"] = best.get("keyed_candidate", False)
+    result["timing"] = best.get("timing", {})
+    result["decoded"] = bool(best.get("decoded"))
+    result["symbols"] = best.get("symbols", "")
+    result["text"] = best.get("text", "")
+    result["confidence"] = best.get("confidence", 0.0)
+    result["base_confidence"] = best.get("base_confidence", 0.0)
+    result["callsigns"] = best.get("callsigns", [])
+    result["unknown_symbols"] = best.get("unknown_symbols", 0)
+    result["score"] = best.get("score", 0.0)
+    if not result["decoded"]:
+        result["reason"] = best.get("reason", "decode failed")
 
-    decoded = decode_runs(runs, float(timing["dit_seconds"]), char_gap_units, word_gap_units)
-    result.update(decoded)
     result["label_candidates"] = [
         {
             "type": "cw_callsign",
             "label": callsign,
             "value": callsign,
             "confidence": result.get("confidence", 0.0),
-            "source": "cw_decode_dsp_v4",
+            "source": "cw_decode_dsp_v5",
+            "tone_hz": tone.get("frequency_hz"),
+            "score": result.get("score", 0.0),
         }
         for callsign in result.get("callsigns", [])
         if float(result.get("confidence", 0.0)) >= label_min_confidence
@@ -382,6 +550,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--on-fraction", type=float, default=0.55)
     parser.add_argument("--off-fraction", type=float, default=0.45)
     parser.add_argument("--label-min-confidence", type=float, default=0.72)
+    parser.add_argument("--auto-tune", dest="auto_tune", action="store_true", default=True, help="Try multiple gate/timing settings and pick the best decode. Default: enabled")
+    parser.add_argument("--no-auto-tune", dest="auto_tune", action="store_false", help="Use only the exact gate/timing settings supplied")
+    parser.add_argument("--max-attempts-reported", type=int, default=8)
     parser.add_argument("--text-only", action="store_true")
     parser.add_argument("--pretty", action="store_true")
     return parser.parse_args()
@@ -403,6 +574,8 @@ def main() -> int:
         label_min_confidence=args.label_min_confidence,
         on_fraction=args.on_fraction,
         off_fraction=args.off_fraction,
+        auto_tune=args.auto_tune,
+        max_attempts_reported=args.max_attempts_reported,
     )
     if args.text_only:
         print(result.get("text", ""))
