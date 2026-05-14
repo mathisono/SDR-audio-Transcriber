@@ -33,7 +33,6 @@ def utc_iso() -> str:
 
 
 def normalize_lmstudio_url(host: str | None, port: int, url: str | None) -> str:
-    """Return an OpenAI-compatible /v1 base URL for LM Studio."""
     if url:
         base = url.strip().rstrip("/")
     else:
@@ -45,7 +44,6 @@ def normalize_lmstudio_url(host: str | None, port: int, url: str | None) -> str:
                 base = f"http://{value}"
             else:
                 base = f"http://{value}:{port}"
-
     if not base.endswith("/v1"):
         base = f"{base}/v1"
     return base
@@ -74,10 +72,16 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
 
 def rebuild_page(transcripts_dir: Path) -> None:
     script_path = Path(__file__).with_name("build_transcript_page.py")
-    subprocess.run(
-        ["python3", str(script_path), "--transcripts", str(transcripts_dir)],
-        check=False,
-    )
+    subprocess.run(["python3", str(script_path), "--transcripts", str(transcripts_dir)], check=False)
+
+
+def normalize_mode_label(value: object) -> str:
+    text = str(value or "unknown_mode").lower().strip()
+    if text in {"fm", "nfm", "narrow", "narrowfm", "narrowband", "narrowbandfm"}:
+        return "nfm"
+    if text in {"wbfm", "wide", "widefm", "wideband", "widebandfm"}:
+        return "wbfm"
+    return text or "unknown_mode"
 
 
 def format_frequency(value: object) -> str:
@@ -105,12 +109,7 @@ def metadata_summary(metadata: dict[str, Any], classification: dict[str, Any] | 
     label_candidates = classification.get("label_candidates") or []
     if label_candidates:
         summary["label_candidates"] = [
-            {
-                "label": item.get("label"),
-                "type": item.get("type"),
-                "confidence": item.get("confidence"),
-                "source": item.get("source"),
-            }
+            {"label": item.get("label"), "type": item.get("type"), "confidence": item.get("confidence"), "source": item.get("source")}
             for item in label_candidates[:5]
         ]
     tone = (classification.get("classification") or classification).get("tone_id") if isinstance(classification, dict) else None
@@ -125,7 +124,6 @@ def metadata_summary(metadata: dict[str, Any], classification: dict[str, Any] | 
 def cleanup_prompt(text: str, mode: str, metadata: dict[str, Any], classification: dict[str, Any] | None = None) -> str:
     context = metadata_summary(metadata, classification)
     raw = text.strip()
-
     common_rules = """
 Core rules:
 - Preserve callsigns, names, frequencies, numbers, radio terms, and technical wording.
@@ -135,33 +133,20 @@ Core rules:
 - Remove obvious ASR filler/repetition caused by radio noise.
 - Return only the cleaned output; do not explain your process.
 """.strip()
-
     if mode == "plain":
-        task = """
-Task: Clean this single radio transcription into readable text.
-Use normal punctuation and capitalization. Keep it as one short paragraph unless the source clearly contains multiple transmissions.
-""".strip()
+        task = "Task: Clean this single radio transcription into readable text. Use normal punctuation and capitalization."
     elif mode == "radio-log":
         task = """
 Task: Format this single clip as a compact radio log entry.
 Preferred output format:
 [station/label or unknown] — cleaned transmission text
 Notes: short uncertainty note only if needed.
-
 Do not add timestamp/frequency unless the transmission text itself needs it; the web page already displays metadata.
-If the text is fragmentary, preserve the fragment but mark uncertain pieces.
 """.strip()
     elif mode == "conservative":
-        task = """
-Task: Produce a conservative copy-edit only.
-Make the smallest possible changes to punctuation/capitalization.
-Do not reorganize the text.
-Do not turn fragments into complete sentences unless the words are clearly present.
-Use [unclear] aggressively for questionable words.
-""".strip()
+        task = "Task: Produce a conservative copy-edit only. Make the smallest possible changes and use [unclear] aggressively."
     else:
         raise ValueError(f"unknown cleanup mode: {mode}")
-
     return f"""
 You are cleaning a short SDR/radio speech-to-text clip.
 
@@ -177,62 +162,32 @@ Raw Whisper transcript:
 """.strip()
 
 
-def call_cleanup_model(
-    text: str,
-    base_url: str,
-    model: str,
-    timeout: int,
-    mode: str = "radio-log",
-    metadata: dict[str, Any] | None = None,
-    classification: dict[str, Any] | None = None,
-    max_tokens: int = 512,
-) -> str:
+def call_cleanup_model(text: str, base_url: str, model: str, timeout: int, mode: str = "radio-log", metadata: dict[str, Any] | None = None, classification: dict[str, Any] | None = None, max_tokens: int = 512) -> str:
     prompt = cleanup_prompt(text, mode, metadata or {}, classification)
-
     payload = {
         "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": "You clean up SDR/radio speech-to-text transcripts conservatively. You never invent details. You preserve uncertainty, callsigns, frequencies, and radio terminology.",
-            },
+            {"role": "system", "content": "You clean up SDR/radio speech-to-text transcripts conservatively. You never invent details."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.05,
         "max_tokens": max_tokens,
     }
-
-    response = requests.post(
-        f"{base_url.rstrip('/')}/chat/completions",
-        json=payload,
-        timeout=timeout,
-    )
+    response = requests.post(f"{base_url.rstrip('/')}/chat/completions", json=payload, timeout=timeout)
     if response.status_code >= 400:
         raise RuntimeError(f"cleanup model failed: HTTP {response.status_code} {response.reason}: {response.text[:2000]}")
     return response.json()["choices"][0]["message"]["content"].strip()
 
 
 def transcribe_file(model: WhisperModel, wav_path: Path) -> tuple[str, list[dict[str, Any]], Any]:
-    segments, info = model.transcribe(
-        str(wav_path),
-        language="en",
-        beam_size=5,
-        vad_filter=True,
-    )
-
+    segments, info = model.transcribe(str(wav_path), language="en", beam_size=5, vad_filter=True)
     parts: list[str] = []
     segment_data: list[dict[str, Any]] = []
     for segment in segments:
         text = segment.text.strip()
         if text:
             parts.append(text)
-        segment_data.append(
-            {
-                "start": round(float(segment.start), 3),
-                "end": round(float(segment.end), 3),
-                "text": text,
-            }
-        )
+        segment_data.append({"start": round(float(segment.start), 3), "end": round(float(segment.end), 3), "text": text})
     return " ".join(parts).strip(), segment_data, info
 
 
@@ -245,13 +200,7 @@ def spoken_callsign_candidates(*texts: str) -> list[dict[str, Any]]:
             if callsign in seen:
                 continue
             seen.add(callsign)
-            candidates.append({
-                "type": "spoken_callsign",
-                "label": callsign,
-                "value": callsign,
-                "confidence": 0.55,
-                "source": "transcript_regex",
-            })
+            candidates.append({"type": "spoken_callsign", "label": callsign, "value": callsign, "confidence": 0.55, "source": "transcript_regex"})
     return candidates
 
 
@@ -260,18 +209,9 @@ def run_clip_classifier(wav_path: Path, cw_external_command: str = "", cw_extern
     cmd = ["python3", str(script_path), str(wav_path)]
     if cw_external_command:
         cmd.extend(["--cw-external-command", cw_external_command, "--cw-external-timeout", str(cw_external_timeout)])
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        return {
-            "enabled": True,
-            "error": result.stderr.strip() or f"classifier exited {result.returncode}",
-            "label_candidates": [],
-        }
+        return {"enabled": True, "error": result.stderr.strip() or f"classifier exited {result.returncode}", "label_candidates": []}
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -296,37 +236,21 @@ def choose_label(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     if not candidates:
         return {"label": None, "confidence": 0.0, "source": None}
     best = candidates[0]
-    return {
-        "label": best.get("label"),
-        "confidence": best.get("confidence", 0.0),
-        "source": best.get("source"),
-        "type": best.get("type"),
-    }
+    return {"label": best.get("label"), "confidence": best.get("confidence", 0.0), "source": best.get("source"), "type": best.get("type")}
 
 
 def load_classification_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {
-            "version": 1,
-            "created_utc": utc_iso(),
-            "updated_utc": None,
-            "contexts": {},
-        }
+        return {"version": 2, "created_utc": utc_iso(), "updated_utc": None, "contexts": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        data.setdefault("version", 1)
+        data.setdefault("version", 2)
         data.setdefault("contexts", {})
         return data
     except json.JSONDecodeError:
         backup = path.with_suffix(path.suffix + f".bad-{int(time.time())}")
         path.rename(backup)
-        return {
-            "version": 1,
-            "created_utc": utc_iso(),
-            "updated_utc": None,
-            "contexts": {},
-            "warning": f"Previous state was invalid JSON and was moved to {backup.name}",
-        }
+        return {"version": 2, "created_utc": utc_iso(), "updated_utc": None, "contexts": {}, "warning": f"Previous state was invalid JSON and was moved to {backup.name}"}
 
 
 def save_classification_state(path: Path, state: dict[str, Any]) -> None:
@@ -337,9 +261,11 @@ def save_classification_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def context_key(record: dict[str, Any]) -> str:
+    source = record.get("source") or "unknown_source"
     receiver = record.get("receiver") or "unknown_receiver"
+    mode = normalize_mode_label(record.get("mode"))
     frequency = record.get("frequency_hz") or "unknown_frequency"
-    return f"{receiver}@{frequency}Hz"
+    return f"{source}/{receiver}/{mode}@{frequency}Hz"
 
 
 def evidence_weight(candidate: dict[str, Any]) -> float:
@@ -365,94 +291,57 @@ def stable_confidence(count: int, weighted_score: float, best_seen_confidence: f
 
 def update_classification_state(path: Path, record: dict[str, Any]) -> dict[str, Any]:
     state = load_classification_state(path)
+    state["version"] = max(int(state.get("version", 1)), 2)
     now = utc_iso()
     key = context_key(record)
     contexts = state.setdefault("contexts", {})
-    context = contexts.setdefault(
-        key,
-        {
-            "receiver": record.get("receiver"),
-            "frequency_hz": record.get("frequency_hz"),
-            "frequency_label": record.get("frequency_label"),
-            "first_seen_utc": now,
-            "last_seen_utc": None,
-            "clip_count": 0,
-            "evidence": {},
-            "promoted_label": None,
-            "recent_files": [],
-        },
-    )
+    context = contexts.setdefault(key, {
+        "source": record.get("source"),
+        "receiver": record.get("receiver"),
+        "mode": normalize_mode_label(record.get("mode")),
+        "frequency_hz": record.get("frequency_hz"),
+        "frequency_label": record.get("frequency_label"),
+        "first_seen_utc": now,
+        "last_seen_utc": None,
+        "clip_count": 0,
+        "evidence": {},
+        "promoted_label": None,
+        "recent_files": [],
+    })
     context["last_seen_utc"] = now
     context["clip_count"] = int(context.get("clip_count", 0)) + 1
+    context["source"] = record.get("source", context.get("source"))
     context["receiver"] = record.get("receiver", context.get("receiver"))
+    context["mode"] = normalize_mode_label(record.get("mode"))
     context["frequency_hz"] = record.get("frequency_hz", context.get("frequency_hz"))
     context["frequency_label"] = record.get("frequency_label", context.get("frequency_label"))
-
     recent_files = context.setdefault("recent_files", [])
     recent_files.append(record.get("file"))
     context["recent_files"] = [item for item in recent_files if item][-20:]
-
     evidence = context.setdefault("evidence", {})
     for candidate in record.get("label_candidates") or []:
         label = str(candidate.get("label") or "").strip()
         if not label:
             continue
-        item = evidence.setdefault(
-            label,
-            {
-                "label": label,
-                "count": 0,
-                "weighted_score": 0.0,
-                "best_seen_confidence": 0.0,
-                "sources": {},
-                "types": {},
-                "first_seen_utc": now,
-                "last_seen_utc": None,
-                "last_file": None,
-                "stable_confidence": 0.0,
-            },
-        )
+        item = evidence.setdefault(label, {"label": label, "count": 0, "weighted_score": 0.0, "best_seen_confidence": 0.0, "sources": {}, "types": {}, "first_seen_utc": now, "last_seen_utc": None, "last_file": None, "stable_confidence": 0.0})
         item["count"] = int(item.get("count", 0)) + 1
         item["last_seen_utc"] = now
         item["last_file"] = record.get("file")
         candidate_conf = float(candidate.get("confidence", 0.0) or 0.0)
         item["best_seen_confidence"] = max(float(item.get("best_seen_confidence", 0.0)), candidate_conf)
         item["weighted_score"] = round(float(item.get("weighted_score", 0.0)) + evidence_weight(candidate), 3)
-
-        source = str(candidate.get("source") or "unknown")
+        src = str(candidate.get("source") or "unknown")
         kind = str(candidate.get("type") or "unknown")
-        item.setdefault("sources", {})[source] = int(item.setdefault("sources", {}).get(source, 0)) + 1
+        item.setdefault("sources", {})[src] = int(item.setdefault("sources", {}).get(src, 0)) + 1
         item.setdefault("types", {})[kind] = int(item.setdefault("types", {}).get(kind, 0)) + 1
-        item["stable_confidence"] = stable_confidence(
-            int(item.get("count", 0)),
-            float(item.get("weighted_score", 0.0)),
-            float(item.get("best_seen_confidence", 0.0)),
-        )
-
-    ranked = sorted(
-        evidence.values(),
-        key=lambda item: (float(item.get("stable_confidence", 0.0)), float(item.get("weighted_score", 0.0)), int(item.get("count", 0))),
-        reverse=True,
-    )
+        item["stable_confidence"] = stable_confidence(int(item.get("count", 0)), float(item.get("weighted_score", 0.0)), float(item.get("best_seen_confidence", 0.0)))
+    ranked = sorted(evidence.values(), key=lambda item: (float(item.get("stable_confidence", 0.0)), float(item.get("weighted_score", 0.0)), int(item.get("count", 0))), reverse=True)
     if ranked:
         best = ranked[0]
-        context["promoted_label"] = {
-            "label": best.get("label"),
-            "stable_confidence": best.get("stable_confidence", 0.0),
-            "count": best.get("count", 0),
-            "weighted_score": best.get("weighted_score", 0.0),
-            "sources": best.get("sources", {}),
-            "updated_utc": now,
-        }
-
+        context["promoted_label"] = {"label": best.get("label"), "stable_confidence": best.get("stable_confidence", 0.0), "count": best.get("count", 0), "weighted_score": best.get("weighted_score", 0.0), "sources": best.get("sources", {}), "updated_utc": now}
     state["updated_utc"] = now
     save_classification_state(path, state)
-    return {
-        "context_key": key,
-        "promoted_label": context.get("promoted_label"),
-        "clip_count": context.get("clip_count", 0),
-        "state_path": str(path),
-    }
+    return {"context_key": key, "promoted_label": context.get("promoted_label"), "clip_count": context.get("clip_count", 0), "state_path": str(path)}
 
 
 def parse_args() -> argparse.Namespace:
@@ -464,26 +353,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transcripts", default="runtime/transcripts")
     parser.add_argument("--classification-state", default="runtime/classification_state.json")
     parser.add_argument("--whisper-model", default="small.en")
-    parser.add_argument("--device", default="cpu", help="cpu or cuda")
-    parser.add_argument("--compute-type", default="int8", help="int8 for CPU, float16 for CUDA")
-    parser.add_argument("--lmstudio-host", default="127.0.0.1", help="LM Studio host/IP, for example 192.168.3.28")
-    parser.add_argument("--lmstudio-port", type=int, default=1234, help="LM Studio server port")
-    parser.add_argument("--lmstudio-url", default=None, help="Full OpenAI-compatible base URL, for example http://192.168.3.28:1234/v1")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--compute-type", default="int8")
+    parser.add_argument("--lmstudio-host", default="127.0.0.1")
+    parser.add_argument("--lmstudio-port", type=int, default=1234)
+    parser.add_argument("--lmstudio-url", default=None)
     parser.add_argument("--cleanup-model", default="bingbangboom/Qwen3508B-transcriber-15k-03")
-    parser.add_argument("--cleanup-mode", choices=CLEANUP_MODES, default="radio-log", help="Qwen cleanup style")
-    parser.add_argument("--cleanup-max-tokens", type=int, default=512, help="Max tokens for per-clip cleanup")
+    parser.add_argument("--cleanup-mode", choices=CLEANUP_MODES, default="radio-log")
+    parser.add_argument("--cleanup-max-tokens", type=int, default=512)
     parser.add_argument("--cleanup-timeout", type=int, default=120)
-    parser.add_argument("--no-cleanup", action="store_true", help="Skip local LLM cleanup step")
-    parser.add_argument("--enable-classifier", action="store_true", help="Enable CW/tone/spoken callsign label candidates")
-    parser.add_argument("--cw-external-command", default="", help="Optional external CW decoder command. Use {wav} placeholder or WAV path is appended.")
+    parser.add_argument("--no-cleanup", action="store_true")
+    parser.add_argument("--enable-classifier", action="store_true")
+    parser.add_argument("--classify-modes", default="nfm", help="Comma list of modes to classify, or all. Default: nfm")
+    parser.add_argument("--cw-external-command", default="")
     parser.add_argument("--cw-external-timeout", type=int, default=20)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     return parser.parse_args()
 
 
+def mode_allowed(mode: object, allowed: str) -> bool:
+    allowed = (allowed or "nfm").strip().lower()
+    if allowed == "all":
+        return True
+    allowed_modes = {normalize_mode_label(item.strip()) for item in allowed.split(",") if item.strip()}
+    return normalize_mode_label(mode) in allowed_modes
+
+
 def main() -> int:
     args = parse_args()
-
     queue = Path(args.queue)
     processing = Path(args.processing)
     done = Path(args.done)
@@ -491,19 +388,11 @@ def main() -> int:
     transcripts = Path(args.transcripts)
     classification_state_path = Path(args.classification_state)
     lmstudio_url = normalize_lmstudio_url(args.lmstudio_host, args.lmstudio_port, args.lmstudio_url)
-
     for directory in [queue, processing, done, failed, transcripts, classification_state_path.parent]:
         directory.mkdir(parents=True, exist_ok=True)
-
     jsonl_path = transcripts / "index.jsonl"
-
     print(f"worker: loading faster-whisper model {args.whisper_model}", flush=True)
-    whisper = WhisperModel(
-        args.whisper_model,
-        device=args.device,
-        compute_type=args.compute_type,
-    )
-
+    whisper = WhisperModel(args.whisper_model, device=args.device, compute_type=args.compute_type)
     rebuild_page(transcripts)
     print("worker: watching queue", flush=True)
     if args.no_cleanup:
@@ -511,103 +400,57 @@ def main() -> int:
     else:
         print(f"worker: cleanup endpoint {lmstudio_url} model={args.cleanup_model} mode={args.cleanup_mode}", flush=True)
     if args.enable_classifier:
-        print(f"worker: classifier enabled state={classification_state_path}", flush=True)
-        if args.cw_external_command:
-            print(f"worker: external CW decoder command={args.cw_external_command}", flush=True)
-
+        print(f"worker: classifier enabled state={classification_state_path} classify_modes={args.classify_modes}", flush=True)
     while True:
         wavs = sorted(queue.glob("*.wav"))
         if not wavs:
             time.sleep(args.poll_seconds)
             continue
-
         wav = wavs[0]
         proc = processing / wav.name
         sidecar_metadata: dict[str, Any] = {}
-
         try:
             sidecar_metadata = load_sidecar(wav)
             shutil.move(str(wav), str(proc))
             move_sidecar(wav, processing)
-
             print(f"worker: transcribing {proc.name}", flush=True)
             raw_text, segments, info = transcribe_file(whisper, proc)
-
-            classification: dict[str, Any] = {"enabled": False, "label_candidates": []}
-            if args.enable_classifier:
+            clip_mode = normalize_mode_label(sidecar_metadata.get("mode"))
+            do_classifier = bool(args.enable_classifier and mode_allowed(clip_mode, args.classify_modes))
+            classification: dict[str, Any] = {"enabled": False, "skipped": None, "label_candidates": []}
+            if do_classifier:
                 classification = run_clip_classifier(proc, args.cw_external_command, args.cw_external_timeout)
-
+            elif args.enable_classifier:
+                classification = {"enabled": False, "skipped": f"mode {clip_mode} not in classify_modes={args.classify_modes}", "label_candidates": []}
             cleanup_error = None
             if args.no_cleanup or not raw_text:
                 clean_text = raw_text
             else:
                 try:
-                    clean_text = call_cleanup_model(
-                        raw_text,
-                        lmstudio_url,
-                        args.cleanup_model,
-                        args.cleanup_timeout,
-                        mode=args.cleanup_mode,
-                        metadata=sidecar_metadata,
-                        classification=classification,
-                        max_tokens=args.cleanup_max_tokens,
-                    )
+                    clean_text = call_cleanup_model(raw_text, lmstudio_url, args.cleanup_model, args.cleanup_timeout, mode=args.cleanup_mode, metadata=sidecar_metadata, classification=classification, max_tokens=args.cleanup_max_tokens)
                 except Exception as exc:
                     cleanup_error = str(exc)
                     clean_text = raw_text
-
-            spoken_candidates = spoken_callsign_candidates(raw_text, clean_text)
-            label_candidates = merge_label_candidates(
-                classification.get("label_candidates", []),
-                spoken_candidates,
-            )
+            spoken_candidates = spoken_callsign_candidates(raw_text, clean_text) if do_classifier else []
+            label_candidates = merge_label_candidates(classification.get("label_candidates", []), spoken_candidates)
             label = choose_label(label_candidates)
-
             duration = sidecar_metadata.get("duration_sec", getattr(info, "duration", None))
-            record: dict[str, Any] = {
-                **sidecar_metadata,
-                "file": proc.name,
-                "created_utc": utc_iso(),
-                "duration_sec": duration,
-                "language": getattr(info, "language", None),
-                "language_probability": getattr(info, "language_probability", None),
-                "raw_text": raw_text,
-                "text": clean_text,
-                "segments": segments,
-                "cleanup_model": None if args.no_cleanup else args.cleanup_model,
-                "cleanup_endpoint": None if args.no_cleanup else lmstudio_url,
-                "cleanup_mode": None if args.no_cleanup else args.cleanup_mode,
-                "cleanup_error": cleanup_error,
-                "classification": classification,
-                "label_candidates": label_candidates,
-                "label": label,
-            }
-
-            if args.enable_classifier:
+            record: dict[str, Any] = {**sidecar_metadata, "file": proc.name, "created_utc": utc_iso(), "duration_sec": duration, "language": getattr(info, "language", None), "language_probability": getattr(info, "language_probability", None), "raw_text": raw_text, "text": clean_text, "segments": segments, "cleanup_model": None if args.no_cleanup else args.cleanup_model, "cleanup_endpoint": None if args.no_cleanup else lmstudio_url, "cleanup_mode": None if args.no_cleanup else args.cleanup_mode, "cleanup_error": cleanup_error, "classification": classification, "label_candidates": label_candidates, "label": label}
+            if do_classifier:
                 record["classification_state"] = update_classification_state(classification_state_path, record)
                 promoted = (record["classification_state"].get("promoted_label") or {})
                 if promoted.get("label"):
                     record["stable_label"] = promoted
-
             output_json = done / f"{proc.stem}.transcript.json"
             output_json.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
             append_jsonl(jsonl_path, record)
             rebuild_page(transcripts)
-
             shutil.move(str(proc), str(done / proc.name))
             move_sidecar(proc, done)
             print(f"worker: done {proc.name}", flush=True)
-
         except Exception as exc:
             print(f"worker: FAILED {wav.name}: {exc}", flush=True)
-            error_record = {
-                **sidecar_metadata,
-                "file": wav.name,
-                "created_utc": utc_iso(),
-                "text": "",
-                "raw_text": "",
-                "error": str(exc),
-            }
+            error_record = {**sidecar_metadata, "file": wav.name, "created_utc": utc_iso(), "text": "", "raw_text": "", "error": str(exc)}
             append_jsonl(jsonl_path, error_record)
             rebuild_page(transcripts)
             try:
@@ -619,7 +462,6 @@ def main() -> int:
                     move_sidecar(wav, failed)
             except Exception:
                 pass
-
     return 0
 
 
