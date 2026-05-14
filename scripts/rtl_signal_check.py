@@ -4,6 +4,10 @@
 This diagnostic scans a small span around a target frequency, reports peak/SNR,
 estimates PPM error, recommends gain/AGC/PPM settings, and can update
 configs/shared_baseband_radio_server.json with --write-config.
+
+PPM writes are guarded. Very large apparent PPM errors are usually caused by
+locking onto the wrong peak, a DC spike, or a neighboring carrier, so the script
+will not write unsafe PPM values unless --force-ppm is used.
 """
 from __future__ import annotations
 
@@ -142,7 +146,21 @@ def recommended_settings(metrics: dict[str, float], args: argparse.Namespace) ->
     snr = float(metrics["snr_db"])
     peak = float(metrics["peak_db"])
     floor = float(metrics["noise_floor_db"])
-    suggested_ppm = int(round(current_ppm - ppm_estimate))
+    raw_suggested_ppm = int(round(current_ppm - ppm_estimate))
+
+    ppm_safe = True
+    ppm_warning = ""
+    if abs(ppm_estimate) > args.max_ppm_delta:
+        ppm_safe = False
+        ppm_warning = f"Unsafe PPM delta {ppm_estimate:+.2f} exceeds max {args.max_ppm_delta}; probably wrong peak/DC/spur."
+    if abs(raw_suggested_ppm) > args.max_abs_ppm:
+        ppm_safe = False
+        ppm_warning = f"Unsafe absolute PPM {raw_suggested_ppm:+d} exceeds max {args.max_abs_ppm}; not writing PPM."
+    if snr < args.min_snr_for_ppm:
+        ppm_safe = False
+        ppm_warning = f"SNR {snr:.1f} dB below minimum {args.min_snr_for_ppm}; not writing PPM."
+
+    suggested_ppm = raw_suggested_ppm if (ppm_safe or args.force_ppm) else int(round(current_ppm))
 
     use_agc = gain_text == "auto"
     suggested_gain: float | None = None
@@ -173,8 +191,11 @@ def recommended_settings(metrics: dict[str, float], args: argparse.Namespace) ->
 
     return {
         "target_frequency_hz": int(metrics["target_hz"]),
+        "raw_suggested_ppm_correction": raw_suggested_ppm,
         "suggested_ppm_correction": suggested_ppm,
         "ppm_delta": round(-ppm_estimate, 2),
+        "ppm_write_safe": ppm_safe or args.force_ppm,
+        "ppm_warning": ppm_warning,
         "suggested_gain_db": suggested_gain,
         "suggested_agc_enabled": suggested_agc,
         "suggested_gain_mode": "auto" if suggested_agc else "manual",
@@ -182,7 +203,7 @@ def recommended_settings(metrics: dict[str, float], args: argparse.Namespace) ->
         "snr_db": round(snr, 1),
         "peak_db": round(peak, 1),
         "noise_floor_db": round(floor, 1),
-        "ppm_note": "very close" if abs(ppm_estimate) <= 2 else "usable but can be tightened" if abs(ppm_estimate) <= 10 else "needs correction or verify peak",
+        "ppm_note": "very close" if abs(ppm_estimate) <= 2 else "usable but can be tightened" if abs(ppm_estimate) <= 10 else "unsafe/verify peak before changing PPM",
     }
 
 
@@ -202,6 +223,8 @@ def print_report(metrics: dict[str, float], recs: dict[str, Any], gain: str, ppm
     print("\nRecommended receiver settings")
     print("-----------------------------")
     print(f"source.ppm_correction: {recs['suggested_ppm_correction']}  ({recs['ppm_delta']:+.2f} ppm delta from this run)")
+    if not recs["ppm_write_safe"]:
+        print(f"PPM write blocked: {recs['ppm_warning']}")
     print(f"source.gain_mode: {recs['suggested_gain_mode']}")
     print(f"source.agc_enabled: {recs['suggested_agc_enabled']}")
     if recs["suggested_gain_db"] is not None:
@@ -216,7 +239,10 @@ def print_report(metrics: dict[str, float], recs: dict[str, Any], gain: str, ppm
 def update_config(path: Path, recs: dict[str, Any], args: argparse.Namespace) -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     source = data.setdefault("source", {})
-    source["ppm_correction"] = recs["suggested_ppm_correction"]
+    if recs["ppm_write_safe"]:
+        source["ppm_correction"] = recs["suggested_ppm_correction"]
+    else:
+        print(f"\nsignal_check: PPM not updated: {recs['ppm_warning']}")
     source["agc_enabled"] = bool(recs["suggested_agc_enabled"])
     source["gain_mode"] = recs["suggested_gain_mode"]
     if recs["suggested_gain_db"] is not None:
@@ -254,6 +280,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--receiver", default="rx-1")
     parser.add_argument("--config", default="configs/shared_baseband_radio_server.json")
     parser.add_argument("--write-config", action="store_true")
+    parser.add_argument("--force-ppm", action="store_true", help="Allow unsafe PPM writes. Use only with a known reference carrier.")
+    parser.add_argument("--max-ppm-delta", type=float, default=25.0, help="Maximum PPM change allowed without --force-ppm")
+    parser.add_argument("--max-abs-ppm", type=float, default=150.0, help="Maximum absolute PPM allowed without --force-ppm")
+    parser.add_argument("--min-snr-for-ppm", type=float, default=12.0, help="Minimum SNR required to write PPM")
     parser.add_argument("--span-khz", type=float, default=200.0)
     parser.add_argument("--bin-hz", type=float, default=1000.0)
     parser.add_argument("--duration", default="10s")
