@@ -10,9 +10,10 @@ Two operating profiles are supported:
     promotes classifier label candidates.
 
   repeater-id
-    Conservative repeater/ham ID extraction. This mode still returns best-effort
-    decoded text, but it only creates cw_callsign label_candidates when a callsign
-    appears as a clean contiguous token with enough decode quality.
+    Conservative repeater/ham ID extraction. This mode scans for CW-like keyed
+    tone segments inside a longer repeater clip, decodes those segments, and only
+    promotes cw_callsign label_candidates when a callsign appears as a clean
+    contiguous token with enough decode quality.
 
 Default profile is repeater-id so the live classifier stays conservative.
 """
@@ -408,6 +409,8 @@ def score_decode(decoded: dict[str, Any], runs: list[tuple[bool, float]], duty_c
             score -= (dash_ratio - 0.82) * 2.0
         if text and set(text.replace(" ", "")) <= {"T", "E"} and len(text.replace(" ", "")) > 8:
             score -= 3.0
+        if callsigns and re.search(r"\bDE\s+" + re.escape(callsigns[0]) + r"\b", text or ""):
+            score += 1.5
     else:
         score += len(LIKELY_ID_WORD_RE.findall(text)) * 0.10
     if duty_cycle < 0.02 or duty_cycle > 0.88:
@@ -446,20 +449,7 @@ def decode_attempt(sample_rate: int, samples: list[float], tone: dict[str, Any],
     return attempt
 
 
-def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int = 10, smooth_frames: int = 0, expected_wpm_min: float = 8.0, expected_wpm_max: float = 30.0, use_wpm_prior: bool | None = None, char_gap_units: float = 2.25, word_gap_units: float = 5.50, label_min_confidence: float = 0.80, on_fraction: float = 0.55, off_fraction: float = 0.45, auto_tune: bool = True, max_attempts_reported: int = 8, profile: str = "repeater-id") -> dict[str, Any]:
-    if profile not in PROFILE_CHOICES:
-        raise ValueError(f"unknown CW profile: {profile}")
-    if use_wpm_prior is None:
-        use_wpm_prior = profile != "practice-text"
-    sample_rate, samples = read_wav_mono(path)
-    duration = len(samples) / sample_rate if sample_rate else 0.0
-    tone = estimate_tone(sample_rate, samples, low_hz, high_hz)
-    result: dict[str, Any] = {"engine": "cw_decode_dsp_v5.4", "profile": profile, "use_wpm_prior": use_wpm_prior, "file": path.name, "sample_rate": sample_rate, "duration_sec": round(duration, 3), "tone": tone, "decoded": False, "text": "", "callsigns": [], "confidence": 0.0}
-    if not tone.get("detected") or not tone.get("frequency_hz"):
-        result["reason"] = tone.get("reason", "tone not detected")
-        result["label_candidates"] = []
-        return result
-
+def decode_core(sample_rate: int, samples: list[float], tone: dict[str, Any], *, frame_ms: int, smooth_frames: int, expected_wpm_min: float, expected_wpm_max: float, use_wpm_prior: bool, char_gap_units: float, word_gap_units: float, label_min_confidence: float, on_fraction: float, off_fraction: float, auto_tune: bool, max_attempts_reported: int, profile: str) -> dict[str, Any]:
     if auto_tune:
         frame_values = sorted(set([frame_ms, 8, 10, 12, 15]))
         smooth_values = sorted(set([smooth_frames, 0, 1, 2, 3]))
@@ -481,7 +471,7 @@ def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int
                     attempts.append(decode_attempt(sample_rate, samples, tone, fm, sm, 0, onf, offf, expected_wpm_min, expected_wpm_max, use_wpm_prior, cgap, wgap, profile))
     attempts.sort(key=lambda item: float(item.get("score", -999.0)), reverse=True)
     best = attempts[0] if attempts else {"decoded": False, "reason": "no attempts"}
-    result.update({
+    result: dict[str, Any] = {
         "attempt_count": len(attempts),
         "best_attempt": {k: v for k, v in best.items() if k != "runs"},
         "attempts": [{k: v for k, v in attempt.items() if k != "runs"} for attempt in attempts[:max_attempts_reported]],
@@ -501,7 +491,7 @@ def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int
         "symbol_stats": best.get("symbol_stats", {}),
         "unknown_symbols": best.get("unknown_symbols", 0),
         "score": best.get("score", 0.0),
-    })
+    }
     if not result["decoded"]:
         result["reason"] = best.get("reason", "decode failed")
 
@@ -509,10 +499,123 @@ def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int
         result["label_candidates"] = []
     else:
         result["label_candidates"] = [
-            {"type": "cw_callsign", "label": callsign, "value": callsign, "confidence": result.get("confidence", 0.0), "source": "cw_decode_dsp_v5.4", "tone_hz": tone.get("frequency_hz"), "score": result.get("score", 0.0), "profile": profile}
+            {"type": "cw_callsign", "label": callsign, "value": callsign, "confidence": result.get("confidence", 0.0), "source": "cw_decode_dsp_v5.5", "tone_hz": tone.get("frequency_hz"), "score": result.get("score", 0.0), "profile": profile}
             for callsign in result.get("callsigns", [])
             if float(result.get("confidence", 0.0)) >= label_min_confidence and float(result.get("score", 0.0)) >= 7.0 and valid_callsign_candidate(callsign, result.get("symbols", ""), result.get("text", ""))
         ]
+    return result
+
+
+def find_cw_segments(sample_rate: int, samples: list[float], tone: dict[str, Any], *, frame_ms: int = 20, min_sec: float = 0.8, gap_sec: float = 0.9, pad_sec: float = 0.25, max_segments: int = 8) -> list[dict[str, Any]]:
+    if not tone.get("detected") or not tone.get("frequency_hz"):
+        return []
+    envelope = tone_envelope(sample_rate, samples, float(tone["frequency_hz"]), frame_ms, smooth_frames=2, median_frames=1)
+    activity, threshold = activity_from_envelope(envelope, 0.55, 0.42)
+    runs = runs_from_activity(activity, frame_ms, glitch_frames=2)
+    if not runs:
+        return []
+
+    # Convert active runs to raw regions and merge nearby regions. Repeater IDs
+    # are often split by character/word gaps, so gap_sec is intentionally long.
+    regions: list[tuple[float, float]] = []
+    cursor = 0.0
+    for active, duration in runs:
+        start = cursor
+        end = cursor + duration
+        if active:
+            regions.append((start, end))
+        cursor = end
+    if not regions:
+        return []
+
+    merged: list[list[float]] = []
+    for start, end in regions:
+        if not merged or start - merged[-1][1] > gap_sec:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = end
+
+    duration_total = len(samples) / sample_rate if sample_rate else 0.0
+    segments: list[dict[str, Any]] = []
+    for start, end in merged:
+        padded_start = max(0.0, start - pad_sec)
+        padded_end = min(duration_total, end + pad_sec)
+        if padded_end - padded_start < min_sec:
+            continue
+        start_idx = max(0, int(padded_start * sample_rate))
+        end_idx = min(len(samples), int(padded_end * sample_rate))
+        segment_samples = samples[start_idx:end_idx]
+        if not segment_samples:
+            continue
+        # Lightweight features for sorting before the expensive decode.
+        seg_env = tone_envelope(sample_rate, segment_samples, float(tone["frequency_hz"]), frame_ms, smooth_frames=1)
+        seg_activity, _ = activity_from_envelope(seg_env, 0.55, 0.42)
+        seg_runs = runs_from_activity(seg_activity, frame_ms, glitch_frames=1)
+        active_time = sum(d for a, d in seg_runs if a)
+        total_time = sum(d for _, d in seg_runs) or 1.0
+        duty_cycle = active_time / total_time
+        segments.append({
+            "start_sec": round(padded_start, 3),
+            "end_sec": round(padded_end, 3),
+            "duration_sec": round(padded_end - padded_start, 3),
+            "duty_cycle": round(duty_cycle, 3),
+            "run_count": len(seg_runs),
+            "samples_start": start_idx,
+            "samples_end": end_idx,
+            "threshold": threshold,
+        })
+
+    segments.sort(key=lambda item: (0.15 < item["duty_cycle"] < 0.75, item["run_count"], item["duration_sec"]), reverse=True)
+    return segments[:max_segments]
+
+
+def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int = 10, smooth_frames: int = 0, expected_wpm_min: float = 8.0, expected_wpm_max: float = 30.0, use_wpm_prior: bool | None = None, char_gap_units: float = 2.25, word_gap_units: float = 5.50, label_min_confidence: float = 0.80, on_fraction: float = 0.55, off_fraction: float = 0.45, auto_tune: bool = True, max_attempts_reported: int = 8, profile: str = "repeater-id", scan_segments: bool | None = None, segment_min_sec: float = 0.8, segment_gap_sec: float = 0.9, segment_pad_sec: float = 0.25, max_segments: int = 8) -> dict[str, Any]:
+    if profile not in PROFILE_CHOICES:
+        raise ValueError(f"unknown CW profile: {profile}")
+    if use_wpm_prior is None:
+        use_wpm_prior = profile != "practice-text"
+    if scan_segments is None:
+        scan_segments = profile == "repeater-id"
+
+    sample_rate, samples = read_wav_mono(path)
+    duration = len(samples) / sample_rate if sample_rate else 0.0
+    tone = estimate_tone(sample_rate, samples, low_hz, high_hz)
+    result: dict[str, Any] = {"engine": "cw_decode_dsp_v5.5", "profile": profile, "use_wpm_prior": use_wpm_prior, "scan_segments": scan_segments, "file": path.name, "sample_rate": sample_rate, "duration_sec": round(duration, 3), "tone": tone, "decoded": False, "text": "", "callsigns": [], "confidence": 0.0}
+    if not tone.get("detected") or not tone.get("frequency_hz"):
+        result["reason"] = tone.get("reason", "tone not detected")
+        result["label_candidates"] = []
+        result["cw_segments"] = []
+        return result
+
+    whole = decode_core(sample_rate, samples, tone, frame_ms=frame_ms, smooth_frames=smooth_frames, expected_wpm_min=expected_wpm_min, expected_wpm_max=expected_wpm_max, use_wpm_prior=use_wpm_prior, char_gap_units=char_gap_units, word_gap_units=word_gap_units, label_min_confidence=label_min_confidence, on_fraction=on_fraction, off_fraction=off_fraction, auto_tune=auto_tune, max_attempts_reported=max_attempts_reported, profile=profile)
+    whole["segment_start_sec"] = 0.0
+    whole["segment_end_sec"] = round(duration, 3)
+    whole["segment_duration_sec"] = round(duration, 3)
+
+    decoded_segments: list[dict[str, Any]] = []
+    if scan_segments and duration >= segment_min_sec:
+        raw_segments = find_cw_segments(sample_rate, samples, tone, frame_ms=max(10, frame_ms), min_sec=segment_min_sec, gap_sec=segment_gap_sec, pad_sec=segment_pad_sec, max_segments=max_segments)
+        for seg in raw_segments:
+            segment_samples = samples[int(seg["samples_start"]):int(seg["samples_end"])]
+            seg_decoded = decode_core(sample_rate, segment_samples, tone, frame_ms=frame_ms, smooth_frames=smooth_frames, expected_wpm_min=expected_wpm_min, expected_wpm_max=expected_wpm_max, use_wpm_prior=use_wpm_prior, char_gap_units=char_gap_units, word_gap_units=word_gap_units, label_min_confidence=label_min_confidence, on_fraction=on_fraction, off_fraction=off_fraction, auto_tune=auto_tune, max_attempts_reported=max(2, min(max_attempts_reported, 4)), profile=profile)
+            seg_public = {k: v for k, v in seg_decoded.items() if k != "runs"}
+            seg_public.update({k: v for k, v in seg.items() if not k.startswith("samples_")})
+            decoded_segments.append(seg_public)
+
+    # Pick a result. Label-bearing segments win. Otherwise use best score.
+    candidates = [whole] + decoded_segments
+    def rank(item: dict[str, Any]) -> tuple[float, float, float, float]:
+        has_label = 1.0 if item.get("label_candidates") else 0.0
+        has_call = 1.0 if item.get("callsigns") else 0.0
+        return (has_label, has_call, float(item.get("score", 0.0) or 0.0), float(item.get("confidence", 0.0) or 0.0))
+    best = sorted(candidates, key=rank, reverse=True)[0]
+
+    result.update({k: v for k, v in best.items() if k not in {"runs"}})
+    result["runs"] = best.get("runs", []) if best is whole else []
+    result["whole_clip_decode"] = {k: v for k, v in whole.items() if k not in {"runs", "attempts"}}
+    result["cw_segments"] = sorted(decoded_segments, key=rank, reverse=True)
+    result["best_segment"] = {k: v for k, v in best.items() if k not in {"runs", "attempts"}} if best is not whole else None
+    result["label_candidates"] = best.get("label_candidates", [])
     return result
 
 
@@ -535,6 +638,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-min-confidence", type=float, default=0.80)
     parser.add_argument("--auto-tune", dest="auto_tune", action="store_true", default=True, help="Try multiple gate/timing settings and pick the best decode. Default: enabled")
     parser.add_argument("--no-auto-tune", dest="auto_tune", action="store_false", help="Use only the exact gate/timing settings supplied")
+    parser.add_argument("--scan-segments", dest="scan_segments", action="store_true", default=None, help="Scan and decode CW-like segments inside the clip")
+    parser.add_argument("--no-scan-segments", dest="scan_segments", action="store_false", help="Disable repeater-ID segment scanning")
+    parser.add_argument("--segment-min-sec", type=float, default=0.8)
+    parser.add_argument("--segment-gap-sec", type=float, default=0.9)
+    parser.add_argument("--segment-pad-sec", type=float, default=0.25)
+    parser.add_argument("--max-segments", type=int, default=8)
     parser.add_argument("--max-attempts-reported", type=int, default=8)
     parser.add_argument("--text-only", action="store_true")
     parser.add_argument("--pretty", action="store_true")
@@ -543,7 +652,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    result = decode_wav(args.wav, low_hz=args.low_hz, high_hz=args.high_hz, frame_ms=args.frame_ms, smooth_frames=args.smooth_frames, expected_wpm_min=args.expected_wpm_min, expected_wpm_max=args.expected_wpm_max, use_wpm_prior=args.wpm_prior, char_gap_units=args.char_gap_units, word_gap_units=args.word_gap_units, label_min_confidence=args.label_min_confidence, on_fraction=args.on_fraction, off_fraction=args.off_fraction, auto_tune=args.auto_tune, max_attempts_reported=args.max_attempts_reported, profile=args.profile)
+    result = decode_wav(args.wav, low_hz=args.low_hz, high_hz=args.high_hz, frame_ms=args.frame_ms, smooth_frames=args.smooth_frames, expected_wpm_min=args.expected_wpm_min, expected_wpm_max=args.expected_wpm_max, use_wpm_prior=args.wpm_prior, char_gap_units=args.char_gap_units, word_gap_units=args.word_gap_units, label_min_confidence=args.label_min_confidence, on_fraction=args.on_fraction, off_fraction=args.off_fraction, auto_tune=args.auto_tune, max_attempts_reported=args.max_attempts_reported, profile=args.profile, scan_segments=args.scan_segments, segment_min_sec=args.segment_min_sec, segment_gap_sec=args.segment_gap_sec, segment_pad_sec=args.segment_pad_sec, max_segments=args.max_segments)
     if args.text_only:
         print(result.get("text", ""))
     else:
