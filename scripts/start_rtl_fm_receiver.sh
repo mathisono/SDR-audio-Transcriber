@@ -8,6 +8,9 @@ FREQUENCY_OVERRIDE=""
 MODE_OVERRIDE=""
 GAIN=""
 THRESHOLD=""
+SAMPLE_RATE_OVERRIDE=""
+AUDIO_RATE_OVERRIDE=""
+HANG_MS_OVERRIDE=""
 VERBOSE=""
 
 usage() {
@@ -19,19 +22,22 @@ By default it reads receivers[].frequency_hz and receivers[].mode from config.
 You can also pass --frequency 442.275M and/or --mode nfm for one-off/live tuning.
 
 Options:
-  --config PATH        Config JSON path. Default: configs/shared_baseband_radio_server.json
-  --receiver ID        Receiver id/name from config. Default: rx-1
-  --frequency FREQ     Override tuned frequency for this run, e.g. 442.275M or 442275000
-  --mode MODE          Override mode for this run: wbfm, widebandfm, nfm, narrowbandfm, or fm
-  --source NAME        Source label for metadata. Default: MSE-88
-  --gain DB            Override SDR gain. Default: source.gain_db from config
-  --threshold RMS      Override clip_writer RMS threshold. Default: clip_writer.squelch_threshold_rms
-  --verbose            Pass --verbose to clip_writer
-  -h, --help           Show this help
+  --config PATH         Config JSON path. Default: configs/shared_baseband_radio_server.json
+  --receiver ID         Receiver id/name from config. Default: rx-1
+  --frequency FREQ      Override tuned frequency for this run, e.g. 442.275M or 442275000
+  --mode MODE           Override mode for this run: wbfm, widebandfm, nfm, narrowbandfm, or fm
+  --source NAME         Source label for metadata. Default: MSE-88
+  --gain DB             Override SDR gain. NFM default is higher than WBFM.
+  --threshold RMS       Override clip_writer RMS threshold. NFM default is lower than WBFM.
+  --sample-rate HZ      Override rtl_fm RF/sample rate. Useful for NFM testing.
+  --audio-rate HZ       Override rtl_fm output audio rate / clip_writer sample rate.
+  --hang-ms MS          Override clip hang time.
+  --verbose             Pass --verbose to clip_writer so you can see RMS levels.
+  -h, --help            Show this help
 
 Examples:
   scripts/start_rtl_fm_receiver.sh --receiver rx-1 --mode wbfm --frequency 90.7M
-  scripts/start_rtl_fm_receiver.sh --receiver rx-1 --mode nfm --frequency 442.275M --threshold 450 --verbose
+  scripts/start_rtl_fm_receiver.sh --receiver rx-1 --mode nfm --frequency 442.275M --threshold 120 --gain 38 --verbose
 
 Persist receiver defaults in config:
   .venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-frequency 442.275M
@@ -48,6 +54,9 @@ while [[ $# -gt 0 ]]; do
     --source) SOURCE="$2"; shift 2 ;;
     --gain) GAIN="$2"; shift 2 ;;
     --threshold) THRESHOLD="$2"; shift 2 ;;
+    --sample-rate) SAMPLE_RATE_OVERRIDE="$2"; shift 2 ;;
+    --audio-rate) AUDIO_RATE_OVERRIDE="$2"; shift 2 ;;
+    --hang-ms) HANG_MS_OVERRIDE="$2"; shift 2 ;;
     --verbose) VERBOSE="--verbose"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -161,24 +170,53 @@ fi
 RTL_MODE="$(normalize_mode "${MODE}")"
 CLIP_MODE="$(metadata_mode "${RTL_MODE}")"
 
-SAMPLE_RATE="$(read_config_value "source.sample_rate" 2>/dev/null || echo 240000)"
-AUDIO_RATE="$(read_config_value "audio.sample_rate" 2>/dev/null || echo 48000)"
-HANG_MS="$(read_config_value "clip_writer.hang_time_ms" 2>/dev/null || echo 1200)"
+CONFIG_SAMPLE_RATE="$(read_config_value "source.sample_rate" 2>/dev/null || echo 240000)"
+CONFIG_AUDIO_RATE="$(read_config_value "audio.sample_rate" 2>/dev/null || echo 48000)"
+CONFIG_HANG_MS="$(read_config_value "clip_writer.hang_time_ms" 2>/dev/null || echo 1200)"
 MIN_SEC="$(read_config_value "clip_writer.min_clip_seconds" 2>/dev/null || echo 1.0)"
 MAX_SEC="$(read_config_value "clip_writer.max_clip_seconds" 2>/dev/null || echo 60.0)"
 QUEUE_DIR="$(read_config_value "clip_writer.queue_directory" 2>/dev/null || echo runtime/queue)"
 TMP_DIR="$(read_config_value "clip_writer.tmp_directory" 2>/dev/null || echo runtime/tmp)"
 
-if [[ -z "${GAIN}" ]]; then
-  GAIN="$(read_config_value "source.gain_db" 2>/dev/null || echo 25)"
+if [[ -n "${SAMPLE_RATE_OVERRIDE}" ]]; then
+  SAMPLE_RATE="${SAMPLE_RATE_OVERRIDE}"
+elif [[ "${CLIP_MODE}" == "nfm" ]]; then
+  SAMPLE_RATE="24000"
+else
+  SAMPLE_RATE="${CONFIG_SAMPLE_RATE}"
 fi
+
+if [[ -n "${AUDIO_RATE_OVERRIDE}" ]]; then
+  AUDIO_RATE="${AUDIO_RATE_OVERRIDE}"
+else
+  AUDIO_RATE="${CONFIG_AUDIO_RATE}"
+fi
+
+if [[ -n "${HANG_MS_OVERRIDE}" ]]; then
+  HANG_MS="${HANG_MS_OVERRIDE}"
+else
+  HANG_MS="${CONFIG_HANG_MS}"
+fi
+
+if [[ -z "${GAIN}" ]]; then
+  if [[ "${CLIP_MODE}" == "nfm" ]]; then
+    GAIN="38"
+  else
+    GAIN="$(read_config_value "source.gain_db" 2>/dev/null || echo 25)"
+  fi
+fi
+
 if [[ -z "${THRESHOLD}" ]]; then
-  THRESHOLD="$(read_config_value "clip_writer.squelch_threshold_rms" 2>/dev/null || echo 650)"
+  if [[ "${CLIP_MODE}" == "nfm" ]]; then
+    THRESHOLD="120"
+  else
+    THRESHOLD="$(read_config_value "clip_writer.squelch_threshold_rms" 2>/dev/null || echo 650)"
+  fi
 fi
 
 mkdir -p "${QUEUE_DIR}" "${TMP_DIR}"
 
-echo "receiver_launcher: source=${SOURCE} receiver=${RECEIVER} mode=${CLIP_MODE} rtl_fm_mode=${RTL_MODE} frequency_hz=${FREQ_HZ} rtl_fm_frequency=${RTL_FREQ} ppm=${PPM_ARGS} gain=${GAIN}"
+echo "receiver_launcher: source=${SOURCE} receiver=${RECEIVER} mode=${CLIP_MODE} rtl_fm_mode=${RTL_MODE} frequency_hz=${FREQ_HZ} rtl_fm_frequency=${RTL_FREQ} ppm=${PPM_ARGS} gain=${GAIN} sample_rate=${SAMPLE_RATE} audio_rate=${AUDIO_RATE} threshold=${THRESHOLD} hang_ms=${HANG_MS}"
 
 # shellcheck disable=SC2086
 rtl_fm -M "${RTL_MODE}" -f "${RTL_FREQ}" -s "${SAMPLE_RATE}" -r "${AUDIO_RATE}" -g "${GAIN}" ${PPM_ARGS} - | \
