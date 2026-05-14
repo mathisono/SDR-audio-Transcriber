@@ -29,8 +29,8 @@ Options:
   --source NAME         Source label for metadata. Default: MSE-88
   --gain DB             Override SDR gain. NFM default is higher than WBFM.
   --threshold RMS       Override clip_writer RMS threshold. NFM default is lower than WBFM.
-  --sample-rate HZ      Override rtl_fm RF/sample rate. Useful for NFM testing.
-  --audio-rate HZ       Override rtl_fm output audio rate / clip_writer sample rate.
+  --sample-rate HZ      Override rtl_fm output sample rate.
+  --audio-rate HZ       Override clip_writer WAV sample rate metadata. Defaults to sample-rate.
   --hang-ms MS          Override clip hang time.
   --verbose             Pass --verbose to clip_writer so you can see RMS levels.
   -h, --help            Show this help
@@ -38,6 +38,7 @@ Options:
 Examples:
   scripts/start_rtl_fm_receiver.sh --receiver rx-1 --mode wbfm --frequency 90.7M
   scripts/start_rtl_fm_receiver.sh --receiver rx-1 --mode nfm --frequency 442.275M --threshold 120 --gain 38 --verbose
+  scripts/start_rtl_fm_receiver.sh --receiver rx-1 --mode nfm --frequency 162.4M --sample-rate 48000 --audio-rate 48000 --verbose
 
 Persist receiver defaults in config:
   .venv/bin/python3 scripts/receiver_config.py --receiver rx-1 set-frequency 442.275M
@@ -171,7 +172,6 @@ RTL_MODE="$(normalize_mode "${MODE}")"
 CLIP_MODE="$(metadata_mode "${RTL_MODE}")"
 
 CONFIG_SAMPLE_RATE="$(read_config_value "source.sample_rate" 2>/dev/null || echo 240000)"
-CONFIG_AUDIO_RATE="$(read_config_value "audio.sample_rate" 2>/dev/null || echo 48000)"
 CONFIG_HANG_MS="$(read_config_value "clip_writer.hang_time_ms" 2>/dev/null || echo 1200)"
 MIN_SEC="$(read_config_value "clip_writer.min_clip_seconds" 2>/dev/null || echo 1.0)"
 MAX_SEC="$(read_config_value "clip_writer.max_clip_seconds" 2>/dev/null || echo 60.0)"
@@ -189,7 +189,9 @@ fi
 if [[ -n "${AUDIO_RATE_OVERRIDE}" ]]; then
   AUDIO_RATE="${AUDIO_RATE_OVERRIDE}"
 else
-  AUDIO_RATE="${CONFIG_AUDIO_RATE}"
+  # rtl_fm reports/output follows -s for this use case. Keep clip_writer WAV
+  # metadata aligned with the actual PCM stream unless explicitly overridden.
+  AUDIO_RATE="${SAMPLE_RATE}"
 fi
 
 if [[ -n "${HANG_MS_OVERRIDE}" ]]; then
@@ -219,7 +221,7 @@ mkdir -p "${QUEUE_DIR}" "${TMP_DIR}"
 echo "receiver_launcher: source=${SOURCE} receiver=${RECEIVER} mode=${CLIP_MODE} rtl_fm_mode=${RTL_MODE} frequency_hz=${FREQ_HZ} rtl_fm_frequency=${RTL_FREQ} ppm=${PPM_ARGS} gain=${GAIN} sample_rate=${SAMPLE_RATE} audio_rate=${AUDIO_RATE} threshold=${THRESHOLD} hang_ms=${HANG_MS}"
 
 # shellcheck disable=SC2086
-rtl_fm -M "${RTL_MODE}" -f "${RTL_FREQ}" -s "${SAMPLE_RATE}" -r "${AUDIO_RATE}" -g "${GAIN}" ${PPM_ARGS} - | \
+rtl_fm -M "${RTL_MODE}" -f "${RTL_FREQ}" -s "${SAMPLE_RATE}" -g "${GAIN}" ${PPM_ARGS} - | \
   "${PY}" scripts/clip_writer.py \
     --queue "${QUEUE_DIR}" \
     --tmp "${TMP_DIR}" \
