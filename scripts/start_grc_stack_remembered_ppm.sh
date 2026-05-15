@@ -5,20 +5,8 @@ set -euo pipefail
 #
 # This wrapper regenerates the FIFO-enabled GRC files, applies the shared PPM
 # from configs/shared_baseband_radio_server.json into the GRC ppm slider value,
+# patches the generated GRC files with the Receiver 1 recorder dB/VU gain scale,
 # then launches the existing GRC stack with GRC regeneration disabled.
-#
-# If you tune the PPM slider in GRC and want to remember that value for next
-# time, run:
-#
-#   .venv/bin/python3 scripts/grc_ppm_config.py \
-#     --grc grc/shared_baseband_one_channel_fifo_nfm.grc \
-#     remember
-#
-# or for WBFM:
-#
-#   .venv/bin/python3 scripts/grc_ppm_config.py \
-#     --grc grc/shared_baseband_one_channel_fifo_wbfm.grc \
-#     remember
 
 MODE="nfm"
 FIFO=""
@@ -29,8 +17,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/start_grc_stack_remembered_ppm.sh [stack options]
 
-Regenerates the FIFO GRC files, applies the remembered shared PPM value, then
-launches the GRC stack.
+Regenerates the FIFO GRC files, applies remembered PPM, applies the Receiver 1
+recorder dB/VU gain scale patch, then launches the GRC stack.
 
 Default launches the CW monitor wrapper too:
 
@@ -38,7 +26,7 @@ Default launches the CW monitor wrapper too:
     --mode nfm \
     --frequency 442.275M \
     --receiver rx-grc-442 \
-    --threshold 80 \
+    --threshold 10000 \
     --cw-adapter \
     --verbose
 
@@ -56,10 +44,6 @@ Remember a PPM value after editing the GRC slider:
   .venv/bin/python3 scripts/grc_ppm_config.py \
     --grc grc/shared_baseband_one_channel_fifo_nfm.grc \
     remember
-
-Show remembered/applied PPM values:
-
-  .venv/bin/python3 scripts/grc_ppm_config.py show
 EOF
 }
 
@@ -107,6 +91,11 @@ mkdir -p runtime/{queue,tmp,processing,done,failed,transcripts,test}
 
 echo "remembered-ppm launcher: regenerating FIFO GRC files"
 "${PY}" scripts/make_shared_baseband_fifo_grc.py --fifo "${FIFO}"
+
+echo "remembered-ppm launcher: applying Receiver 1 recorder dB/VU gain scale"
+"${PY}" scripts/patch_grc_recorder_vu_scale.py \
+  grc/shared_baseband_one_channel_fifo_nfm.grc \
+  grc/shared_baseband_one_channel_fifo_wbfm.grc
 
 echo "remembered-ppm launcher: applying shared PPM into GRC files"
 "${PY}" scripts/grc_ppm_config.py \
