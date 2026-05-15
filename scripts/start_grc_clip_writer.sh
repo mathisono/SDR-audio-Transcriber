@@ -15,6 +15,7 @@ HANG_MS="1800"
 QUEUE="runtime/queue"
 TMP="runtime/tmp"
 FIFO=""
+CONTROL="runtime/recorder_control.json"
 VERBOSE=""
 
 usage() {
@@ -37,14 +38,20 @@ Options:
   --mode MODE           Metadata mode: nfm, fm, wbfm, widefm
   --sample-rate HZ      PCM sample rate from GRC. Must match GRC output rate.
                         Default: 24000 for nfm/fm, 48000 for wbfm/widefm.
-  --threshold RMS       clip_writer RMS threshold.
+  --threshold RMS       Initial clip_writer RMS threshold.
                         Default: 80 for nfm/fm, 60 for wbfm/widefm.
+  --control PATH        JSON live recorder control file.
+                        Default: runtime/recorder_control.json
   --hang-ms MS          clip_writer hang time. Default: 1800
   --fifo PATH           FIFO path. Default: repo/runtime/grc_audio.pcm absolute path
   --queue PATH          Queue directory. Default: runtime/queue
   --tmp PATH            Temp directory. Default: runtime/tmp
   --verbose             Pass --verbose to clip_writer
   -h, --help            Show this help
+
+Live threshold control while running:
+  .venv/bin/python3 scripts/set_recorder_control.py --threshold 10000
+  .venv/bin/python3 scripts/set_recorder_control.py --threshold 6000 --hang-ms 2500
 
 Typical NFM test:
   scripts/start_grc_clip_writer.sh \
@@ -99,6 +106,7 @@ while [[ $# -gt 0 ]]; do
     --mode) MODE="$2"; shift 2 ;;
     --sample-rate) SAMPLE_RATE="$2"; shift 2 ;;
     --threshold) THRESHOLD="$2"; shift 2 ;;
+    --control) CONTROL="$2"; shift 2 ;;
     --hang-ms) HANG_MS="$2"; shift 2 ;;
     --fifo) FIFO="$2"; shift 2 ;;
     --queue) QUEUE="$2"; shift 2 ;;
@@ -131,6 +139,9 @@ fi
 if [[ "${TMP}" != /* ]]; then
   TMP="${ROOT_DIR}/${TMP}"
 fi
+if [[ "${CONTROL}" != /* ]]; then
+  CONTROL="${ROOT_DIR}/${CONTROL}"
+fi
 
 if [[ -z "${SAMPLE_RATE}" ]]; then
   if [[ "${MODE}" == "nfm" ]]; then
@@ -149,16 +160,26 @@ if [[ -z "${THRESHOLD}" ]]; then
 fi
 
 FREQUENCY_HZ="$(parse_frequency_hz "${FREQUENCY}")"
-mkdir -p "${QUEUE}" "${TMP}" "$(dirname "${FIFO}")"
+mkdir -p "${QUEUE}" "${TMP}" "$(dirname "${FIFO}")" "$(dirname "${CONTROL}")"
 rm -f "${FIFO}"
 mkfifo "${FIFO}"
+
+# Seed the live-control file on every launch so the visible starting value matches this run.
+cat > "${CONTROL}" <<EOF
+{
+  "threshold": ${THRESHOLD},
+  "hang_ms": ${HANG_MS},
+  "min_sec": 1.0,
+  "max_sec": 60.0
+}
+EOF
 
 cleanup() {
   rm -f "${FIFO}"
 }
 trap cleanup EXIT
 
-echo "grc_clip_writer: waiting on fifo=${FIFO} source=${SOURCE} receiver=${RECEIVER} mode=${MODE} frequency_hz=${FREQUENCY_HZ} sample_rate=${SAMPLE_RATE} threshold=${THRESHOLD} hang_ms=${HANG_MS} queue=${QUEUE} tmp=${TMP}"
+echo "grc_clip_writer: waiting on fifo=${FIFO} source=${SOURCE} receiver=${RECEIVER} mode=${MODE} frequency_hz=${FREQUENCY_HZ} sample_rate=${SAMPLE_RATE} threshold=${THRESHOLD} hang_ms=${HANG_MS} control=${CONTROL} queue=${QUEUE} tmp=${TMP}"
 
 cat "${FIFO}" | "${PY}" scripts/clip_writer.py \
   --queue "${QUEUE}" \
@@ -169,5 +190,6 @@ cat "${FIFO}" | "${PY}" scripts/clip_writer.py \
   --mode "${MODE}" \
   --sample-rate "${SAMPLE_RATE}" \
   --threshold "${THRESHOLD}" \
+  --threshold-control "${CONTROL}" \
   --hang-ms "${HANG_MS}" \
   ${VERBOSE}
