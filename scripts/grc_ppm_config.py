@@ -6,15 +6,14 @@ with the existing shared config used by the rest of the SDR tools:
 
     configs/shared_baseband_radio_server.json -> source.ppm_correction
 
-Typical use:
+The parser intentionally accepts --grc either before or after the command because
+older launch wrappers used both forms.
 
-    # Save the value currently present in a GRC file into shared config
+Examples:
+
+    python3 scripts/grc_ppm_config.py --grc grc/shared_baseband_one_channel_fifo_nfm.grc remember
     python3 scripts/grc_ppm_config.py remember --grc grc/shared_baseband_one_channel_fifo_nfm.grc
-
-    # Apply shared config PPM into generated GRC files
     python3 scripts/grc_ppm_config.py apply --grc grc/shared_baseband_one_channel_fifo_nfm.grc
-
-    # Show both values
     python3 scripts/grc_ppm_config.py show --grc grc/shared_baseband_one_channel_fifo_nfm.grc
 """
 from __future__ import annotations
@@ -22,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -89,18 +89,66 @@ def existing_grc_files(paths: list[Path]) -> list[Path]:
     return [path for path in paths if path.exists()]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Remember/apply GRC PPM value")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--grc", type=Path, action="append", default=[], help="GRC file. May be supplied multiple times.")
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    commands = {"show", "remember", "apply", "set"}
 
-    sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("show", help="Show shared config PPM and GRC file PPM")
-    sub.add_parser("remember", help="Read PPM from the first GRC file and save it to shared config")
-    sub.add_parser("apply", help="Apply shared config PPM to GRC file(s)")
-    set_parser = sub.add_parser("set", help="Set shared config PPM and apply it to GRC file(s)")
-    set_parser.add_argument("ppm", type=int)
-    return parser.parse_args()
+    command = None
+    ppm_value = None
+    config = DEFAULT_CONFIG
+    grc_files: list[Path] = []
+    passthrough: list[str] = []
+
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in commands and command is None:
+            command = token
+            i += 1
+            if command == "set":
+                if i >= len(argv):
+                    raise SystemExit("set requires a ppm value")
+                ppm_value = int(argv[i])
+                i += 1
+            continue
+        if token == "--config":
+            if i + 1 >= len(argv):
+                raise SystemExit("--config requires a path")
+            config = Path(argv[i + 1])
+            i += 2
+            continue
+        if token == "--grc":
+            if i + 1 >= len(argv):
+                raise SystemExit("--grc requires a path")
+            grc_files.append(Path(argv[i + 1]))
+            i += 2
+            continue
+        if token in {"-h", "--help"}:
+            print_help()
+            raise SystemExit(0)
+        passthrough.append(token)
+        i += 1
+
+    if command is None:
+        print_help()
+        raise SystemExit("missing command: use show, remember, apply, or set")
+    if passthrough:
+        raise SystemExit(f"unrecognized arguments: {' '.join(passthrough)}")
+
+    return argparse.Namespace(command=command, ppm=ppm_value, config=config, grc=grc_files)
+
+
+def print_help() -> None:
+    print(
+        "usage: grc_ppm_config.py [--config CONFIG] [--grc GRC ...] {show,remember,apply,set} [ppm]\n\n"
+        "Commands:\n"
+        "  show       Show shared config PPM and GRC file PPM\n"
+        "  remember   Read PPM from the first GRC file and save it to shared config\n"
+        "  apply      Apply shared config PPM to GRC file(s)\n"
+        "  set PPM    Set shared config PPM and apply it to GRC file(s)\n\n"
+        "Notes:\n"
+        "  --grc may be placed before or after the command.\n"
+    )
 
 
 def main() -> int:
