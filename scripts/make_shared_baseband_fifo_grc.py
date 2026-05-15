@@ -5,7 +5,7 @@ The outputs keep the same GUI/layout style as the reference flowgraph and add:
 - fifo_path variable
 - record_control_path variable
 - audio_gain QT slider
-- Recorder Threshold QT slider in the Receiver 1 branch/control area
+- Receiver 1 Recorder Threshold RMS QT slider in the Receiver 1 control block
 - Multiply Const on demod audio
 - Float to Short
 - File Sink writing mono s16le PCM to the FIFO used by start_grc_clip_writer.sh
@@ -75,8 +75,8 @@ def extra_fifo_vars(fifo_path: str, record_control_path: str, record_threshold_d
             "variable_qtgui_range",
             {
                 "comment": "'Audio scale before recorder output. Lower if clipped; raise if quiet.'",
-                "gui_hint": "2,6,1,2",
-                "label": "Recorder Audio Gain",
+                "gui_hint": "3,4,1,2",
+                "label": "Receiver 1 Recorder Audio Gain",
                 "min_len": "'200'",
                 "orient": "Qt.Horizontal",
                 "rangeType": "float",
@@ -92,8 +92,8 @@ def extra_fifo_vars(fifo_path: str, record_control_path: str, record_threshold_d
             "record_threshold",
             "variable_qtgui_range",
             {
-                "comment": "'Live recorder RMS threshold. This is visually placed with Receiver 1 controls and bridged to runtime/recorder_control.json by scripts/run_grc_threshold_bridge.py.'",
-                "gui_hint": "2,8,1,2",
+                "comment": "'Live recorder RMS threshold. This is visually placed in the Receiver 1 Qt control block and bridged to runtime/recorder_control.json by scripts/run_grc_threshold_bridge.py.'",
+                "gui_hint": "3,6,1,2",
                 "label": "Receiver 1 Recorder Threshold RMS",
                 "min_len": "'200'",
                 "orient": "Qt.Horizontal",
