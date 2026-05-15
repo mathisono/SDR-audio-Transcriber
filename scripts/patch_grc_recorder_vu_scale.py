@@ -9,9 +9,8 @@ Adds two GRC-side visual controls in the Receiver 1 Qt area:
 2. A dB/log recorder gain slider with reference marks:
    -40 | -30 | -20 | -10 | -3 | 0 unity | +3 | +10
 
-This patch is intentionally post-generation because GNU Radio 3.8 GRC widgets
-are easier to add after scripts/make_shared_baseband_fifo_grc.py emits the basic
-FIFO flowgraph.
+The level meter uses a float absolute-value block, not complex magnitude, because
+the recorder audio branch is a float stream.
 """
 from __future__ import annotations
 
@@ -81,14 +80,15 @@ GAIN_AND_METER_BLOCKS = """- name: audio_gain
     state: enabled
 """
 
-LEVEL_BLOCKS = """- name: blocks_complex_to_mag_squared_0
-  id: blocks_complex_to_mag_squared
+LEVEL_BLOCKS = """- name: blocks_abs_xx_0
+  id: blocks_abs_xx
   parameters:
     affinity: ''
     alias: ''
-    comment: 'Recorder level detector before FIFO. Input is float audio; output is magnitude squared.'
+    comment: 'Recorder level detector before FIFO. Input is float audio; output is absolute value.'
     maxoutbuf: '0'
     minoutbuf: '0'
+    type: float
     vlen: '1'
   states:
     bus_sink: false
@@ -150,6 +150,8 @@ LEVEL_BLOCKS = """- name: blocks_complex_to_mag_squared_0
     state: enabled
 """
 
+OLD_BAD_LEVEL_BLOCK_NAME = "blocks_complex_to_mag_squared_0"
+
 
 def insert_before_connections(text: str, blocks: str) -> str:
     marker = "connections:\n"
@@ -167,34 +169,66 @@ def add_connection(text: str, connection: str) -> str:
     return text.replace(marker, marker + connection, 1)
 
 
+def remove_bad_complex_meter(text: str) -> str:
+    # Remove the older incorrect complex magnitude block/links if a previously
+    # generated GRC file is being patched in-place instead of regenerated.
+    if OLD_BAD_LEVEL_BLOCK_NAME not in text:
+        return text
+    start = text.find("- name: blocks_complex_to_mag_squared_0\n")
+    end = text.find("- name: blocks_moving_average_xx_0\n", start)
+    if start != -1 and end != -1:
+        text = text[:start] + text[end:]
+    text = text.replace("- [blocks_multiply_const_vxx_0, '0', blocks_complex_to_mag_squared_0, '0']\n", "")
+    text = text.replace("- [blocks_complex_to_mag_squared_0, '0', blocks_moving_average_xx_0, '0']\n", "")
+    return text
+
+
 def patch_file(path: Path) -> bool:
     if not path.exists():
         print(f"skip missing {path}")
         return False
     text = path.read_text(encoding="utf-8")
-    changed = False
+    original = text
+
+    text = remove_bad_complex_meter(text)
 
     if "name: recorder_gain_db" not in text:
         if OLD_AUDIO_GAIN not in text:
             raise SystemExit(f"could not find expected Receiver 1 Recorder Audio Gain block in {path}")
         text = text.replace(OLD_AUDIO_GAIN, GAIN_AND_METER_BLOCKS, 1)
-        changed = True
 
     if "name: qtgui_number_sink_0" not in text:
         text = insert_before_connections(text, LEVEL_BLOCKS)
-        changed = True
+    elif "name: blocks_abs_xx_0" not in text:
+        text = insert_before_connections(text, """- name: blocks_abs_xx_0
+  id: blocks_abs_xx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: 'Recorder level detector before FIFO. Input is float audio; output is absolute value.'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    type: float
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [1220, 560]
+    rotation: 0
+    state: enabled
+""")
 
-    # The level meter taps the recorder audio after the recorder gain multiply.
-    text = add_connection(text, "- [blocks_multiply_const_vxx_0, '0', blocks_complex_to_mag_squared_0, '0']\n")
-    text = add_connection(text, "- [blocks_complex_to_mag_squared_0, '0', blocks_moving_average_xx_0, '0']\n")
+    text = add_connection(text, "- [blocks_multiply_const_vxx_0, '0', blocks_abs_xx_0, '0']\n")
+    text = add_connection(text, "- [blocks_abs_xx_0, '0', blocks_moving_average_xx_0, '0']\n")
     text = add_connection(text, "- [blocks_moving_average_xx_0, '0', qtgui_number_sink_0, '0']\n")
 
-    if changed:
+    if text != original:
         path.write_text(text, encoding="utf-8")
         print(f"patched {path}")
-    else:
-        print(f"already patched {path}")
-    return changed
+        return True
+    print(f"already patched {path}")
+    return False
 
 
 def main() -> int:
