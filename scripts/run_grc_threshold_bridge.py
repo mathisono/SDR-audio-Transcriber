@@ -4,18 +4,6 @@
 GNU Radio Companion's QT slider updates a generated set_record_threshold()
 method. This wrapper patches that generated Python file immediately before
 running it so every slider movement writes runtime/recorder_control.json.
-
-The generated GRC run command should call this instead of running the generated
-file directly:
-
-    python3 -u scripts/run_grc_threshold_bridge.py {filename}
-
-The flowgraph must define:
-  - record_threshold variable_qtgui_range
-  - record_control_path variable
-
-clip_writer.py must be running with --threshold-control pointing at the same JSON
-file, which the GRC stack launcher now does through start_grc_clip_writer.sh.
 """
 from __future__ import annotations
 
@@ -28,14 +16,16 @@ HELPER = r'''
 
 def _openclaw_write_record_control(path, threshold):
     try:
+        import json as _json
+        import os as _os
         if path is None:
             path = 'runtime/recorder_control.json'
-        path = os.path.expanduser(str(path))
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        path = _os.path.expanduser(str(path))
+        _os.makedirs(_os.path.dirname(path) or '.', exist_ok=True)
         data = {}
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
+                loaded = _json.load(f)
                 if isinstance(loaded, dict):
                     data = loaded
         except Exception:
@@ -46,9 +36,9 @@ def _openclaw_write_record_control(path, threshold):
         data.setdefault('max_sec', 60.0)
         tmp_name = path + '.tmp'
         with open(tmp_name, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+            _json.dump(data, f, indent=2)
             f.write('\n')
-        os.replace(tmp_name, path)
+        _os.replace(tmp_name, path)
     except Exception as exc:
         print('GRC recorder threshold bridge write failed:', exc, flush=True)
 '''
@@ -57,11 +47,6 @@ def _openclaw_write_record_control(path, threshold):
 def patch_source(source: str) -> str:
     if "_openclaw_write_record_control" in source:
         return source
-
-    if "import sys\n" in source:
-        source = source.replace("import sys\n", "import sys\nimport json\nimport os\n", 1)
-    else:
-        source = "import json\nimport os\n" + source
 
     class_match = re.search(r"\nclass\s+\w+\(gr\.top_block", source)
     if not class_match:
