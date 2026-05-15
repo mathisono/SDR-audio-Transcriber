@@ -3,7 +3,9 @@
 
 The outputs keep the same GUI/layout style as the reference flowgraph and add:
 - fifo_path variable
+- record_control_path variable
 - audio_gain QT slider
+- Recorder Threshold QT slider in the Receiver 1 branch/control area
 - Multiply Const on demod audio
 - Float to Short
 - File Sink writing mono s16le PCM to the FIFO used by start_grc_clip_writer.sh
@@ -44,13 +46,11 @@ def replace_first(text: str, old: str, new: str) -> str:
 
 
 def grc_string_value(value: str) -> str:
-    # GRC variable value is a Python string expression, represented in YAML.
-    # Example: '"/home/mat/repo/runtime/grc_audio.pcm"'
     escaped = value.replace('"', '\\"')
     return f"'\"{escaped}\"'"
 
 
-def extra_fifo_vars(fifo_path: str) -> str:
+def extra_fifo_vars(fifo_path: str, record_control_path: str, record_threshold_default: int) -> str:
     return "\n".join([
         block(
             "fifo_path",
@@ -62,12 +62,21 @@ def extra_fifo_vars(fifo_path: str) -> str:
             "[160, 200]",
         ),
         block(
+            "record_control_path",
+            "variable",
+            {
+                "comment": "'JSON control file watched by clip_writer.py for live recorder threshold changes.'",
+                "value": grc_string_value(record_control_path),
+            },
+            "[160, 260]",
+        ),
+        block(
             "audio_gain",
             "variable_qtgui_range",
             {
                 "comment": "'Audio scale before recorder output. Lower if clipped; raise if quiet.'",
                 "gui_hint": "2,6,1,2",
-                "label": "Audio Gain to Recorder",
+                "label": "Recorder Audio Gain",
                 "min_len": "'200'",
                 "orient": "Qt.Horizontal",
                 "rangeType": "float",
@@ -78,6 +87,24 @@ def extra_fifo_vars(fifo_path: str) -> str:
                 "widget": "counter_slider",
             },
             "[1220, 350]",
+        ),
+        block(
+            "record_threshold",
+            "variable_qtgui_range",
+            {
+                "comment": "'Live recorder RMS threshold. This is visually placed with Receiver 1 controls and bridged to runtime/recorder_control.json by scripts/run_grc_threshold_bridge.py.'",
+                "gui_hint": "2,8,1,2",
+                "label": "Receiver 1 Recorder Threshold RMS",
+                "min_len": "'200'",
+                "orient": "Qt.Horizontal",
+                "rangeType": "int",
+                "start": "'0'",
+                "step": "'100'",
+                "stop": "'20000'",
+                "value": f"'{record_threshold_default}'",
+                "widget": "counter_slider",
+            },
+            "[1220, 410]",
         ),
     ])
 
@@ -152,7 +179,7 @@ def nbfm_block() -> str:
     )
 
 
-def generate_variant(source_text: str, mode: str, fifo_path: str) -> str:
+def generate_variant(source_text: str, mode: str, fifo_path: str, record_control_path: str, record_threshold_default: int) -> str:
     mode = mode.lower()
     if mode not in {"wbfm", "nfm"}:
         raise ValueError(mode)
@@ -166,12 +193,17 @@ def generate_variant(source_text: str, mode: str, fifo_path: str) -> str:
     text = replace_first(
         text,
         "description: RTL-SDR shared baseband with one WBFM demod branch",
-        f"description: RTL-SDR shared baseband with one {title_mode} demod branch plus FIFO PCM output for SDR-audio-Transcriber",
+        f"description: RTL-SDR shared baseband with one {title_mode} demod branch plus FIFO PCM output and Receiver 1 recorder threshold control",
     )
     text = replace_first(
         text,
         "comment: First working shared-baseband one-channel test flowgraph",
-        f"comment: Shared-baseband one-channel {title_mode} test flowgraph with FIFO recorder output",
+        f"comment: Shared-baseband one-channel {title_mode} test flowgraph with FIFO recorder output and Receiver 1 threshold slider",
+    )
+    text = replace_first(
+        text,
+        "run_command: '{python} -u {filename}'",
+        "run_command: '{python} -u scripts/run_grc_threshold_bridge.py {filename}'",
     )
 
     if mode == "nfm":
@@ -189,7 +221,7 @@ def generate_variant(source_text: str, mode: str, fifo_path: str) -> str:
         text = text.replace("analog_wfm_rcv_0", "analog_nbfm_rx_0")
 
     marker = "- name: chan1_cutoff\n"
-    text = replace_first(text, marker, extra_fifo_vars(fifo_path) + "\n" + marker)
+    text = replace_first(text, marker, extra_fifo_vars(fifo_path, record_control_path, record_threshold_default) + "\n" + marker)
     text = replace_first(text, "connections:\n", fifo_blocks() + "\nconnections:\n")
 
     demod_name = "analog_nbfm_rx_0" if mode == "nfm" else "analog_wfm_rcv_0"
@@ -211,12 +243,15 @@ def main() -> int:
     parser.add_argument("--input", default="grc/shared_baseband_one_channel.grc")
     parser.add_argument("--mode", choices=["both", "wbfm", "nfm"], default="both")
     parser.add_argument("--fifo", default=None, help="Absolute FIFO path to write in generated GRC. Defaults to repo/runtime/grc_audio.pcm")
+    parser.add_argument("--record-control", default=None, help="Absolute recorder control JSON path. Defaults to repo/runtime/recorder_control.json")
+    parser.add_argument("--record-threshold", type=int, default=10000, help="Default Recorder Threshold slider value in generated GRC")
     parser.add_argument("--output", default=None, help="Output path. Only valid with --mode wbfm or --mode nfm.")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
     source_text = (repo_root / args.input).read_text(encoding="utf-8") if not Path(args.input).is_absolute() else Path(args.input).read_text(encoding="utf-8")
     fifo_path = str(Path(args.fifo).expanduser().resolve()) if args.fifo else str((repo_root / "runtime" / "grc_audio.pcm").resolve())
+    record_control_path = str(Path(args.record_control).expanduser().resolve()) if args.record_control else str((repo_root / "runtime" / "recorder_control.json").resolve())
     modes = ["wbfm", "nfm"] if args.mode == "both" else [args.mode]
 
     for mode in modes:
@@ -228,10 +263,11 @@ def main() -> int:
             raise SystemExit("--output can only be used when --mode is wbfm or nfm")
         else:
             out_path = repo_root / f"grc/shared_baseband_one_channel_fifo_{mode}.grc"
-        out_path.write_text(generate_variant(source_text, mode, fifo_path), encoding="utf-8")
+        out_path.write_text(generate_variant(source_text, mode, fifo_path, record_control_path, args.record_threshold), encoding="utf-8")
         print(f"wrote {out_path}")
 
     print(f"GRC FIFO path is: {fifo_path}")
+    print(f"GRC recorder control path is: {record_control_path}")
     print("Open with: gnuradio-companion grc/shared_baseband_one_channel_fifo_wbfm.grc")
     print("      or: gnuradio-companion grc/shared_baseband_one_channel_fifo_nfm.grc")
     return 0
