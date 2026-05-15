@@ -15,6 +15,7 @@ the recorder audio branch is a float stream.
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 DEFAULT_GRC = [
@@ -61,7 +62,7 @@ GAIN_AND_METER_BLOCKS = """- name: audio_gain
   id: variable_qtgui_range
   parameters:
     comment: 'Receiver 1 recorder gain shown as a dB/log control. 0 dB is unity gain.'
-    gui_hint: 3,5,1,2
+    gui_hint: 4,4,1,2
     label: Receiver 1 Recorder Gain dB    -40 | -30 | -20 | -10 | -3 | 0 unity | +3 | +10
     min_len: '300'
     orient: Qt.Horizontal
@@ -169,9 +170,21 @@ def add_connection(text: str, connection: str) -> str:
     return text.replace(marker, marker + connection, 1)
 
 
+def normalize_gui_hints(text: str) -> str:
+    # GNU Radio 3.8 is picky about invalid Qt range gui_hint values and crashes
+    # generation with a NoneType template error. Keep all added Receiver 1
+    # widgets in a known-good column/span pattern used by the original file.
+    replacements = {
+        "gui_hint: 3,5,1,2": "gui_hint: 4,4,1,2",
+        "gui_hint: 3,6,1,2": "gui_hint: 5,4,1,2",
+        "gui_hint: 3,8,1,2": "gui_hint: 5,4,1,2",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
 def remove_bad_complex_meter(text: str) -> str:
-    # Remove the older incorrect complex magnitude block/links if a previously
-    # generated GRC file is being patched in-place instead of regenerated.
     if OLD_BAD_LEVEL_BLOCK_NAME not in text:
         return text
     start = text.find("- name: blocks_complex_to_mag_squared_0\n")
@@ -191,6 +204,7 @@ def patch_file(path: Path) -> bool:
     original = text
 
     text = remove_bad_complex_meter(text)
+    text = normalize_gui_hints(text)
 
     if "name: recorder_gain_db" not in text:
         if OLD_AUDIO_GAIN not in text:
@@ -222,6 +236,8 @@ def patch_file(path: Path) -> bool:
     text = add_connection(text, "- [blocks_multiply_const_vxx_0, '0', blocks_abs_xx_0, '0']\n")
     text = add_connection(text, "- [blocks_abs_xx_0, '0', blocks_moving_average_xx_0, '0']\n")
     text = add_connection(text, "- [blocks_moving_average_xx_0, '0', qtgui_number_sink_0, '0']\n")
+
+    text = normalize_gui_hints(text)
 
     if text != original:
         path.write_text(text, encoding="utf-8")
