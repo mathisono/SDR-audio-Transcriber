@@ -10,13 +10,15 @@ set -euo pipefail
 # If you tune the PPM slider in GRC and want to remember that value for next
 # time, run:
 #
-#   .venv/bin/python3 scripts/grc_ppm_config.py remember \
-#     --grc grc/shared_baseband_one_channel_fifo_nfm.grc
+#   .venv/bin/python3 scripts/grc_ppm_config.py \
+#     --grc grc/shared_baseband_one_channel_fifo_nfm.grc \
+#     remember
 #
 # or for WBFM:
 #
-#   .venv/bin/python3 scripts/grc_ppm_config.py remember \
-#     --grc grc/shared_baseband_one_channel_fifo_wbfm.grc
+#   .venv/bin/python3 scripts/grc_ppm_config.py \
+#     --grc grc/shared_baseband_one_channel_fifo_wbfm.grc \
+#     remember
 
 MODE="nfm"
 FIFO=""
@@ -51,8 +53,9 @@ All other options are passed through to the selected stack launcher.
 
 Remember a PPM value after editing the GRC slider:
 
-  .venv/bin/python3 scripts/grc_ppm_config.py remember \
-    --grc grc/shared_baseband_one_channel_fifo_nfm.grc
+  .venv/bin/python3 scripts/grc_ppm_config.py \
+    --grc grc/shared_baseband_one_channel_fifo_nfm.grc \
+    remember
 
 Show remembered/applied PPM values:
 
@@ -106,14 +109,16 @@ echo "remembered-ppm launcher: regenerating FIFO GRC files"
 "${PY}" scripts/make_shared_baseband_fifo_grc.py --fifo "${FIFO}"
 
 echo "remembered-ppm launcher: applying shared PPM into GRC files"
-"${PY}" scripts/grc_ppm_config.py apply \
+"${PY}" scripts/grc_ppm_config.py \
   --grc grc/shared_baseband_one_channel.grc \
   --grc grc/shared_baseband_one_channel_fifo_nfm.grc \
-  --grc grc/shared_baseband_one_channel_fifo_wbfm.grc
+  --grc grc/shared_baseband_one_channel_fifo_wbfm.grc \
+  apply
 
 echo "remembered-ppm launcher: current PPM state"
-"${PY}" scripts/grc_ppm_config.py show \
-  --grc "grc/shared_baseband_one_channel_fifo_${MODE}.grc"
+"${PY}" scripts/grc_ppm_config.py \
+  --grc "grc/shared_baseband_one_channel_fifo_${MODE}.grc" \
+  show
 
 if [[ "${WITH_CW_MONITOR}" == "1" ]]; then
   exec scripts/start_grc_stack_with_cw_monitor.sh --no-generate-grc "${PASSTHRU_ARGS[@]}"
