@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
-"""Patch generated FIFO GRC files with Receiver 1 recorder gain and level UI.
+"""Patch generated FIFO GRC files with Receiver 1 recorder volume and level UI.
 
 Adds two GRC-side visual controls in the Receiver 1 Qt area:
 
 1. A moving recorder level indicator using qtgui_number_sink on the recorder audio
    branch. This shows actual activity from the demodulated audio being sent to
    the FIFO/clip writer.
-2. A dB/log recorder gain slider with reference marks:
-   -40 | -30 | -20 | -10 | -3 | 0 unity | +3 | +10
+2. An integer Recorder Volume slider. 100 is unity gain, below 100 attenuates,
+   above 100 boosts.
 
-The level meter uses a float absolute-value block, not complex magnitude, because
-the recorder audio branch is a float stream.
+The level meter uses a float absolute-value block because the recorder audio
+branch is a float stream.
 """
 from __future__ import annotations
 
 import argparse
-import re
 from pathlib import Path
 
 DEFAULT_GRC = [
@@ -49,8 +48,8 @@ OLD_AUDIO_GAIN = """- name: audio_gain
 GAIN_AND_METER_BLOCKS = """- name: audio_gain
   id: variable
   parameters:
-    comment: 'Linear recorder multiplier derived from Recorder Gain dB: 10 ** (recorder_gain_db / 20).'
-    value: 10**(recorder_gain_db / 20.0)
+    comment: 'Linear recorder multiplier derived from Receiver 1 Recorder Volume: recorder_volume / 100. 100 is unity gain.'
+    value: recorder_volume / 100.0
   states:
     bus_sink: false
     bus_source: false
@@ -58,19 +57,19 @@ GAIN_AND_METER_BLOCKS = """- name: audio_gain
     coordinate: [160, 320]
     rotation: 0
     state: enabled
-- name: recorder_gain_db
+- name: recorder_volume
   id: variable_qtgui_range
   parameters:
-    comment: 'Receiver 1 recorder gain shown as a dB/log control. 0 dB is unity gain.'
+    comment: 'Receiver 1 recorder volume. 100 is unity, lower attenuates, higher boosts.'
     gui_hint: 4,4,1,2
-    label: Receiver 1 Recorder Gain dB    -40 | -30 | -20 | -10 | -3 | 0 unity | +3 | +10
+    label: Receiver 1 Recorder Volume    0 | 25 | 50 | 75 | 100 unity | 125 | 150 | 200
     min_len: '300'
     orient: Qt.Horizontal
-    rangeType: float
-    start: '-40'
-    step: '1'
-    stop: '10'
-    value: '0'
+    rangeType: int
+    start: '0'
+    step: '5'
+    stop: '200'
+    value: '100'
     widget: counter_slider
   states:
     bus_sink: false
@@ -132,7 +131,7 @@ LEVEL_BLOCKS = """- name: blocks_abs_xx_0
     factor2: '1'
     graph_type: horiz
     gui_hint: 3,4,1,2
-    label1: Recorder Level    -40 | -30 | -20 | -10 | -3 | 0 unity | +3 | +10
+    label1: Recorder Level    0 | 25 | 50 | 75 | 100 unity | 125 | 150 | 200
     label2: ''
     max: '1.0'
     min: '0.0'
@@ -171,9 +170,6 @@ def add_connection(text: str, connection: str) -> str:
 
 
 def normalize_gui_hints(text: str) -> str:
-    # GNU Radio 3.8 is picky about invalid Qt range gui_hint values and crashes
-    # generation with a NoneType template error. Keep all added Receiver 1
-    # widgets in a known-good column/span pattern used by the original file.
     replacements = {
         "gui_hint: 3,5,1,2": "gui_hint: 4,4,1,2",
         "gui_hint: 3,6,1,2": "gui_hint: 5,4,1,2",
@@ -196,6 +192,18 @@ def remove_bad_complex_meter(text: str) -> str:
     return text
 
 
+def remove_old_db_gain(text: str) -> str:
+    if "name: recorder_gain_db" not in text:
+        return text
+    start = text.find("- name: audio_gain\n  id: variable\n")
+    end = text.find("- name: record_threshold\n", start)
+    if start != -1 and end != -1:
+        text = text[:start] + GAIN_AND_METER_BLOCKS + text[end:]
+    text = text.replace("recorder_gain_db / 20.0", "recorder_volume / 100.0")
+    text = text.replace("name: recorder_gain_db", "name: recorder_volume")
+    return text
+
+
 def patch_file(path: Path) -> bool:
     if not path.exists():
         print(f"skip missing {path}")
@@ -204,9 +212,10 @@ def patch_file(path: Path) -> bool:
     original = text
 
     text = remove_bad_complex_meter(text)
+    text = remove_old_db_gain(text)
     text = normalize_gui_hints(text)
 
-    if "name: recorder_gain_db" not in text:
+    if "name: recorder_volume" not in text:
         if OLD_AUDIO_GAIN not in text:
             raise SystemExit(f"could not find expected Receiver 1 Recorder Audio Gain block in {path}")
         text = text.replace(OLD_AUDIO_GAIN, GAIN_AND_METER_BLOCKS, 1)
@@ -248,7 +257,7 @@ def patch_file(path: Path) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Patch generated FIFO GRC files with Receiver 1 recorder level meter and dB gain scale")
+    parser = argparse.ArgumentParser(description="Patch generated FIFO GRC files with Receiver 1 recorder level meter and integer volume control")
     parser.add_argument("grc", nargs="*", type=Path, default=DEFAULT_GRC)
     args = parser.parse_args()
     for path in args.grc:
