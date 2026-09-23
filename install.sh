@@ -12,6 +12,15 @@ if [[ "${EUID}" -eq 0 ]]; then
   exit 1
 fi
 
+# The pinned faster-whisper/PyAV runtime is intentionally unchanged. Select an
+# explicit supported interpreter instead of applying Python 3.8 pins to 3.13.
+PYTHON="${PYTHON:-python3}"
+"${PYTHON}" - <<'PY'
+import sys
+if not (3, 8) <= sys.version_info[:2] < (3, 12):
+    raise SystemExit('Pinned ASR dependencies require Python 3.8-3.11. Use PYTHON=python3.11 bash install.sh with that interpreter installed.')
+PY
+
 if command -v apt-get >/dev/null 2>&1; then
   echo "Installing Debian/Ubuntu system packages..."
   sudo apt-get update
@@ -51,14 +60,12 @@ mkdir -p \
   "${ROOT_DIR}/runtime/failed" \
   "${ROOT_DIR}/runtime/transcripts"
 
-# Keep runtime directories in git without committing captured audio/transcripts.
 for dir in queue tmp processing done failed transcripts; do
   touch "${ROOT_DIR}/runtime/${dir}/.gitkeep"
 done
 
 echo "Creating Python virtual environment..."
-python3 -m venv "${VENV_DIR}"
-# shellcheck source=/dev/null
+"${PYTHON}" -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 python -m pip install --upgrade pip wheel setuptools
 python -m pip install "Cython==0.29.37"
@@ -67,51 +74,44 @@ PIP_CONSTRAINT="${ROOT_DIR}/constraints-python38.txt" python -m pip install -r "
 chmod +x \
   "${ROOT_DIR}/scripts/clip_writer.py" \
   "${ROOT_DIR}/scripts/transcribe_worker.py" \
+  "${ROOT_DIR}/scripts/enrichment_worker.py" \
+  "${ROOT_DIR}/scripts/start_rtl_fm_receiver.sh" \
+  "${ROOT_DIR}/scripts/verify_asr.py" \
   "${ROOT_DIR}/scripts/build_transcript_page.py" \
   "${ROOT_DIR}/scripts/audio_fft_ppm_finder_terminal.py" \
   "${ROOT_DIR}/scripts/ppm_config.py"
 
-cat > "${ROOT_DIR}/runtime/transcripts/index.html" <<'HTML'
+# Reinstallation must not replace a working transcript dashboard.
+if [[ ! -e "${ROOT_DIR}/runtime/transcripts/index.html" ]]; then
+  cat > "${ROOT_DIR}/runtime/transcripts/index.html" <<'HTML'
 <!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>SDR Audio Transcripts</title></head>
-<body><h1>SDR Audio Transcripts</h1><p>No transcripts yet.</p></body>
-</html>
+<html lang="en"><meta charset="utf-8"><title>SDR Audio Transcripts</title>
+<h1>SDR Audio Transcripts</h1><p>No transcripts yet.</p></html>
 HTML
+fi
 
-cat <<EOF
+cat <<'EOF'
 
-Install complete.
+Install complete. From the repository root:
 
-Activate the venv:
   source .venv/bin/activate
+  bash scripts/start_rtl_fm_receiver.sh --mode nfm --frequency 162.4M --no-calibrate --verbose
 
-Show the shared SDR source PPM correction:
-  python3 scripts/ppm_config.py show
+Speech-only worker (another terminal):
 
-Set the shared SDR source PPM correction once:
-  python3 scripts/ppm_config.py set 135
-
-Start a first WBFM recorder test using the configured PPM value:
-  PPM_ARGS="\$(python3 scripts/ppm_config.py rtl-fm-args)"
-  rtl_fm -M wbfm -f 90.7M -s 240k -r 48k -g 25 \${PPM_ARGS} - | \\
-    python3 scripts/clip_writer.py --source MSE-88 --frequency 90700000 --receiver receiver1
-
-Start the transcription worker without LM Studio cleanup:
-  source .venv/bin/activate
   python3 scripts/transcribe_worker.py --whisper-model small.en --device cpu --compute-type int8 --no-cleanup
 
-Start the transcription worker with LM Studio cleanup on another box:
-  source .venv/bin/activate
-  python3 scripts/transcribe_worker.py --whisper-model small.en --device cpu --compute-type int8 --lmstudio-host 192.168.3.28
+Optional CW: add --enable-classifier to that worker and start another process:
 
-You can also pass a full OpenAI-compatible URL:
-  python3 scripts/transcribe_worker.py --lmstudio-url http://192.168.3.28:1234/v1
+  python3 scripts/enrichment_worker.py
 
-Serve the web page in another terminal:
+Cleanup is now opt-in: add --enable-cleanup, omit --no-cleanup, and run the same
+sidecar. --lmstudio-host/--lmstudio-url still configure its endpoint.
+
+Serve locally:
+
   cd runtime/transcripts
-  python3 -m http.server 8090
+  python3 -m http.server 8090 --bind 127.0.0.1
 
-Then open:
-  http://localhost:8090/
+See README.md and docs/speech-first-reliability.md for validation and migration.
 EOF

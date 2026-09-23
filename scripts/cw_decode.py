@@ -173,25 +173,50 @@ def extract_callsigns(text: str, symbols: str = "", profile: str = "repeater-id"
 
 
 def estimate_tone(sample_rate: int, samples: list[float], low_hz: int, high_hz: int) -> dict[str, Any]:
-    window = samples[: min(len(samples), sample_rate * 15)]
-    if len(window) < sample_rate // 2:
+    """Accumulate short-window power over the ENTIRE clip, including late IDs.
+
+    Summing powers (rather than complex amplitudes over 15 s) avoids phase
+    cancellation between bursts. Silence cannot hide an ID at the clip's end.
+    """
+    if not 0 < low_hz <= high_hz < sample_rate / 2:
+        raise ValueError("tone search requires 0 < low-hz <= high-hz < Nyquist")
+    if len(samples) < sample_rate // 2:
         return {"detected": False, "reason": "clip too short"}
-    coarse = list(range(low_hz, high_hz + 1, 25))
-    coarse_powers = [(freq, goertzel_power(window, sample_rate, freq)) for freq in coarse]
-    coarse_powers.sort(key=lambda item: item[1], reverse=True)
-    best_freq = coarse_powers[0][0]
-    floor = statistics.median([p for _, p in coarse_powers]) or 1.0
-    fine = list(range(max(low_hz, best_freq - 45), min(high_hz, best_freq + 45) + 1, 5))
-    fine_powers = [(freq, goertzel_power(window, sample_rate, freq)) for freq in fine]
-    fine_powers.sort(key=lambda item: item[1], reverse=True)
-    freq, power = fine_powers[0]
-    ratio = power / floor
+    # Block averaging reduces tone-search cost at common 24/48 kHz rates.
+    # Only use exact integer decimation, retaining an analysis Nyquist above
+    # the search band. The decoding path itself still uses the original PCM.
+    factor = max(1, sample_rate // max(8000, high_hz * 4))
+    while sample_rate % factor:
+        factor -= 1
+    if factor > 1:
+        analysis = [sum(samples[i:i + factor]) / factor
+                    for i in range(0, len(samples) - factor + 1, factor)]
+        rate = sample_rate // factor
+    else:
+        analysis, rate = samples, sample_rate
+    size = max(1, rate // 5)
+    windows = [analysis[i:i + size] for i in range(0, len(analysis), size)]
+    windows = [w for w in windows if len(w) >= rate // 20 and sum(x * x for x in w) > 1e-12]
+    if not windows:
+        return {"detected": False, "reason": "silent clip"}
+    def power(freq: int) -> float:
+        return sum(goertzel_power(w, rate, freq) / len(w) for w in windows)
+    coarse = [(freq, power(freq)) for freq in range(low_hz, high_hz + 1, 25)]
+    coarse.sort(key=lambda item: item[1], reverse=True)
+    best_freq = coarse[0][0]
+    floor = max(statistics.median([v for _, v in coarse]), 1e-12)
+    fine = [(freq, power(freq)) for freq in range(max(low_hz, best_freq - 45), min(high_hz, best_freq + 45) + 1, 5)]
+    fine.sort(key=lambda item: item[1], reverse=True)
+    freq, peak = fine[0]
+    ratio = peak / floor
     return {
         "detected": ratio >= 5.0,
         "frequency_hz": int(freq),
         "power_ratio": round(ratio, 3),
         "confidence": round(max(0.0, min(1.0, math.log10(max(ratio, 1.0)) / 2.0)), 3),
-        "top_frequencies": [{"frequency_hz": int(f), "relative_power": round(p / floor, 3)} for f, p in fine_powers[:5]],
+        "confidence_kind": "uncalibrated heuristic; not a probability",
+        "search_duration_sec": round(len(samples) / sample_rate, 3),
+        "top_frequencies": [{"frequency_hz": int(f), "relative_power": round(v / floor, 3)} for f, v in fine[:5]],
     }
 
 
@@ -372,7 +397,7 @@ def decode_runs(runs: list[tuple[bool, float]], dit: float, char_gap_units: floa
     if profile == "repeater-id" and stats["mark_count"] >= 12 and (stats["dash_ratio"] < 0.05 or stats["dash_ratio"] > 0.95):
         confidence = min(confidence, 0.55)
     return {
-        "decoded": bool(text),
+        "decoded": bool(known_non_space),
         "symbols": symbols_text,
         "text": text,
         "confidence": round(confidence, 3),
@@ -418,8 +443,9 @@ def score_decode(decoded: dict[str, Any], runs: list[tuple[bool, float]], duty_c
     return round(score, 4)
 
 
-def decode_attempt(sample_rate: int, samples: list[float], tone: dict[str, Any], frame_ms: int, smooth_frames: int, median_frames: int, on_fraction: float, off_fraction: float, expected_wpm_min: float, expected_wpm_max: float, use_wpm_prior: bool, char_gap_units: float, word_gap_units: float, profile: str) -> dict[str, Any]:
-    envelope = tone_envelope(sample_rate, samples, float(tone["frequency_hz"]), frame_ms, smooth_frames, median_frames)
+def decode_attempt(sample_rate: int, samples: list[float], tone: dict[str, Any], frame_ms: int, smooth_frames: int, median_frames: int, on_fraction: float, off_fraction: float, expected_wpm_min: float, expected_wpm_max: float, use_wpm_prior: bool, char_gap_units: float, word_gap_units: float, profile: str, envelope: list[tuple[float, float]] | None = None) -> dict[str, Any]:
+    if envelope is None:
+        envelope = tone_envelope(sample_rate, samples, float(tone["frequency_hz"]), frame_ms, smooth_frames, median_frames)
     activity, threshold = activity_from_envelope(envelope, on_fraction, off_fraction)
     runs = runs_from_activity(activity, frame_ms, glitch_frames=max(1, smooth_frames))
     active_time = sum(duration for active, duration in runs if active)
@@ -464,11 +490,13 @@ def decode_core(sample_rate: int, samples: list[float], tone: dict[str, Any], *,
     attempts: list[dict[str, Any]] = []
     for fm in frame_values:
         for sm in smooth_values:
+            # The same envelope serves all 16 gate/gap combinations.
+            envelope = tone_envelope(sample_rate, samples, float(tone["frequency_hz"]), fm, sm, 0)
             for onf, offf in gate_values:
                 if offf >= onf:
                     continue
                 for cgap, wgap in gap_values:
-                    attempts.append(decode_attempt(sample_rate, samples, tone, fm, sm, 0, onf, offf, expected_wpm_min, expected_wpm_max, use_wpm_prior, cgap, wgap, profile))
+                    attempts.append(decode_attempt(sample_rate, samples, tone, fm, sm, 0, onf, offf, expected_wpm_min, expected_wpm_max, use_wpm_prior, cgap, wgap, profile, envelope=envelope))
     attempts.sort(key=lambda item: float(item.get("score", -999.0)), reverse=True)
     best = attempts[0] if attempts else {"decoded": False, "reason": "no attempts"}
     result: dict[str, Any] = {
@@ -570,6 +598,10 @@ def find_cw_segments(sample_rate: int, samples: list[float], tone: dict[str, Any
 
 
 def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int = 10, smooth_frames: int = 0, expected_wpm_min: float = 8.0, expected_wpm_max: float = 30.0, use_wpm_prior: bool | None = None, char_gap_units: float = 2.25, word_gap_units: float = 5.50, label_min_confidence: float = 0.80, on_fraction: float = 0.55, off_fraction: float = 0.45, auto_tune: bool = True, max_attempts_reported: int = 8, profile: str = "repeater-id", scan_segments: bool | None = None, segment_min_sec: float = 0.8, segment_gap_sec: float = 0.9, segment_pad_sec: float = 0.25, max_segments: int = 8) -> dict[str, Any]:
+    if not 0 < expected_wpm_min <= expected_wpm_max or frame_ms <= 0:
+        raise ValueError("require 0 < WPM minimum <= maximum and frame-ms > 0")
+    if not 0 <= off_fraction < on_fraction <= 1 or smooth_frames < 0:
+        raise ValueError("invalid gating or smoothing parameters")
     if profile not in PROFILE_CHOICES:
         raise ValueError(f"unknown CW profile: {profile}")
     if use_wpm_prior is None:
@@ -616,6 +648,7 @@ def decode_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int
     result["cw_segments"] = sorted(decoded_segments, key=rank, reverse=True)
     result["best_segment"] = {k: v for k, v in best.items() if k not in {"runs", "attempts"}} if best is not whole else None
     result["label_candidates"] = best.get("label_candidates", [])
+    result["confidence_kind"] = "uncalibrated heuristic; not a probability"
     return result
 
 

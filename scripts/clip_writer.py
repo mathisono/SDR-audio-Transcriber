@@ -1,306 +1,246 @@
 #!/usr/bin/env python3
-"""Squelch-gated WAV clip writer for SDR audio.
-
-This script reads 16-bit signed little-endian mono PCM from stdin, measures
-short-window RMS energy, opens a temporary WAV file when the squelch opens, and
-renames the completed WAV into runtime/queue only after the hang timer expires.
-
-The important safety rule is that the transcription worker only sees complete
-*.wav files, never partially written files.
-"""
+"""Publish complete s16le mono WAVs. EOF/SIGINT/SIGTERM finalize active audio."""
 from __future__ import annotations
 
 import argparse
-import audioop
+import array
 import json
+import math
 import os
-import re
+import select
+import signal
+import sys
 import time
+import uuid
 import wave
-from datetime import datetime, timezone
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+
+from safe_runtime import atomic_json, archive_file, fsync_directory, read_json
 
 CHUNK_MS = 100
 
 
-def utc_stamp_for_filename() -> str:
-    # Include milliseconds so multiple receivers opening in the same second do
-    # not collide. Keep the format sortable by time.
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%d_%H%M%S") + f".{int(now.microsecond / 1000):03d}Z"
-
-
 def utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
 def safe_token(value: object) -> str:
-    text = str(value).strip().replace(" ", "_")
-    text = re.sub(r"[^A-Za-z0-9_.+-]+", "_", text)
-    return text.strip("_") or "unknown"
+    import re
+    return re.sub(r'[^A-Za-z0-9_.+-]+', '_', str(value)).strip('_') or 'unknown'
 
 
-def frequency_label(frequency_hz: int) -> str:
-    if frequency_hz >= 1_000_000:
-        mhz = frequency_hz / 1_000_000.0
-        return f"{mhz:.6f}MHz"
-    if frequency_hz >= 1_000:
-        khz = frequency_hz / 1_000.0
-        return f"{khz:.3f}kHz"
-    return f"{frequency_hz}Hz"
+def frequency_label(hz: int) -> str:
+    return f'{hz / 1_000_000:.6f}MHz' if hz >= 1_000_000 else f'{hz}Hz'
 
 
-def open_wav(path: Path, sample_rate: int) -> wave.Wave_write:
-    wf = wave.open(str(path), "wb")
-    wf.setnchannels(1)
-    wf.setsampwidth(2)  # 16-bit PCM
-    wf.setframerate(sample_rate)
-    return wf
-
-
-def write_sidecar(path: Path, metadata: dict) -> None:
-    path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-
-def load_control(path: Path | None) -> dict[str, Any]:
-    if not path or not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def maybe_update_live_settings(
-    *,
-    control_path: Path | None,
-    current_threshold: int,
-    current_hang_ms: int,
-    current_max_sec: float,
-    current_min_sec: float,
-    last_mtime_ns: int | None,
-) -> tuple[int, int, float, float, int | None, bool]:
-    if not control_path or not control_path.exists():
-        return current_threshold, current_hang_ms, current_max_sec, current_min_sec, last_mtime_ns, False
-    try:
-        stat = control_path.stat()
-    except OSError:
-        return current_threshold, current_hang_ms, current_max_sec, current_min_sec, last_mtime_ns, False
-    if last_mtime_ns == stat.st_mtime_ns:
-        return current_threshold, current_hang_ms, current_max_sec, current_min_sec, last_mtime_ns, False
-
-    data = load_control(control_path)
-    threshold = int(data.get("threshold", data.get("threshold_rms", current_threshold)))
-    hang_ms = int(data.get("hang_ms", current_hang_ms))
-    max_sec = float(data.get("max_sec", current_max_sec))
-    min_sec = float(data.get("min_sec", current_min_sec))
-    return threshold, hang_ms, max_sec, min_sec, stat.st_mtime_ns, True
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Record squelch-gated WAV clips from mono 16-bit PCM on stdin."
-    )
-    parser.add_argument("--queue", default="runtime/queue", help="Completed WAV output directory")
-    parser.add_argument("--tmp", default="runtime/tmp", help="Temporary partial-file directory")
-    parser.add_argument("--receiver", default="receiver1", help="Receiver ID/name for filenames")
-    parser.add_argument("--source", default="unknown", help="Source hostname or SDR label")
-    parser.add_argument("--mode", default="wbfm", help="Receiver mode metadata")
-    parser.add_argument("--frequency", type=int, default=None, help="Active tuned receiver frequency in Hz")
-    parser.add_argument("--frequency-hz", type=int, default=None, help="Active tuned receiver frequency in Hz")
-    parser.add_argument("--frequency-mhz", type=float, default=None, help="Active tuned receiver frequency in MHz, for example 441.000")
-    parser.add_argument("--sample-rate", type=int, default=48000, help="PCM sample rate in Hz")
-    parser.add_argument("--threshold", type=int, default=650, help="RMS threshold that opens squelch")
-    parser.add_argument("--threshold-control", default="", help="Optional JSON file watched for live threshold/hang changes")
-    parser.add_argument("--hang-ms", type=int, default=1200, help="Audio hang time after RMS drops")
-    parser.add_argument("--min-sec", type=float, default=1.0, help="Drop clips shorter than this")
-    parser.add_argument("--max-sec", type=float, default=60.0, help="Force-close clips after this long")
-    parser.add_argument("--verbose", action="store_true", help="Print periodic RMS levels")
-    return parser.parse_args()
+def rms_s16le(data: bytes) -> int:
+    samples = array.array('h')
+    samples.frombytes(data)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    return math.isqrt(sum(x * x for x in samples) // len(samples)) if samples else 0
 
 
 def resolve_frequency_hz(args: argparse.Namespace) -> int:
     if args.frequency_mhz is not None:
-        return int(round(args.frequency_mhz * 1_000_000))
+        return round(args.frequency_mhz * 1_000_000)
     if args.frequency_hz is not None:
-        return int(args.frequency_hz)
-    if args.frequency is not None:
-        return int(args.frequency)
-    # Preserve old behavior for compatibility, but make startup output explicit.
-    return 90700000
+        return args.frequency_hz
+    return args.frequency if args.frequency is not None else 90700000
+
+
+def validate_settings(threshold: int, hang_ms: int, minimum: float, maximum: float) -> None:
+    if not 0 <= threshold <= 32768 or hang_ms < 0:
+        raise ValueError('threshold must be 0..32768 and hang-ms must be nonnegative')
+    if not all(math.isfinite(v) for v in (minimum, maximum)) or not 0 <= minimum <= maximum or maximum <= 0:
+        raise ValueError('require 0 <= min-sec <= max-sec and max-sec > 0')
+
+
+class ClipWriter:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.queue, self.tmp = Path(args.queue), Path(args.tmp)
+        for directory in (self.queue, self.tmp):
+            directory.mkdir(parents=True, exist_ok=True)
+        if self.queue.stat().st_dev != self.tmp.stat().st_dev:
+            raise ValueError('queue and tmp must share a filesystem for atomic publication')
+        self.rate = args.sample_rate
+        if not 1000 <= self.rate <= 384000 or args.pre_roll_ms < 0:
+            raise ValueError('sample-rate must be 1000..384000; pre-roll-ms must be nonnegative')
+        self.threshold, self.hang = args.threshold, args.hang_ms
+        self.minimum, self.maximum = args.min_sec, args.max_sec
+        validate_settings(self.threshold, self.hang, self.minimum, self.maximum)
+        self.pre_roll = deque(maxlen=max(0, math.ceil(args.pre_roll_ms / CHUNK_MS)))
+        self.wf = None
+        self.frames = self.silent_frames = 0
+        self.pending = bytearray()
+        self.control = Path(args.threshold_control) if args.threshold_control else None
+        self.control_mtime = None
+        if self.control and not self.control.exists():
+            atomic_json(self.control, {'threshold': self.threshold, 'hang_ms': self.hang,
+                                      'min_sec': self.minimum, 'max_sec': self.maximum})
+        self.last_control_check = self.last_verbose = 0.0
+
+    def update_control(self) -> None:
+        if not self.control or time.monotonic() - self.last_control_check < 0.5:
+            return
+        self.last_control_check = time.monotonic()
+        try:
+            stamp = self.control.stat().st_mtime_ns
+            if stamp == self.control_mtime:
+                return
+            self.control_mtime = stamp
+            value = read_json(self.control)
+            settings = (int(value.get('threshold', value.get('threshold_rms', self.threshold))),
+                        int(value.get('hang_ms', self.hang)), float(value.get('min_sec', self.minimum)),
+                        float(value.get('max_sec', self.maximum)))
+            validate_settings(*settings)
+            self.threshold, self.hang, self.minimum, self.maximum = settings
+        except (OSError, ValueError, TypeError) as exc:
+            print(f'clip_writer: invalid live settings ignored: {exc}', file=sys.stderr, flush=True)
+
+    def open(self) -> None:
+        now = datetime.now(timezone.utc)
+        pre_frames = sum(len(x) // 2 for x in self.pre_roll)
+        self.started = (now - timedelta(seconds=pre_frames / self.rate)).isoformat().replace('+00:00', 'Z')
+        hz = resolve_frequency_hz(self.args)
+        name = '__'.join([now.strftime('%Y-%m-%d_%H%M%S.%fZ'), safe_token(self.args.source),
+                          safe_token(self.args.receiver), frequency_label(hz), safe_token(self.args.mode),
+                          uuid.uuid4().hex[:12]])
+        self.partial = self.tmp / (name + '.wav.part')
+        self.final = self.queue / (name + '.wav')
+        self.wf = wave.open(str(self.partial), 'wb')
+        self.wf.setparams((1, 2, self.rate, 0, 'NONE', 'not compressed'))
+        self.frames = self.silent_frames = 0
+        # Bound pre-roll by the maximum clip size, even with unusual CLI settings.
+        capacity = max(0, int(self.maximum * self.rate) - 1) * 2
+        pre = b''.join(self.pre_roll)[-capacity:] if capacity else b''
+        self.started = (now - timedelta(seconds=len(pre) / (2 * self.rate))).isoformat().replace('+00:00', 'Z')
+        if pre:
+            self.wf.writeframesraw(pre)
+            self.frames += len(pre) // 2
+        self.pre_roll.clear()
+        print(f'clip_writer: OPEN {self.partial}', flush=True)
+
+    def close(self, reason: str) -> None:
+        if self.wf is None:
+            return
+        self.wf.close()
+        self.wf = None
+        duration = self.frames / self.rate
+        if duration < self.minimum:
+            self.partial.unlink()
+            print(f'clip_writer: DROP short clip {duration:.3f}s', flush=True)
+            return
+        with self.partial.open('rb') as stream:
+            os.fsync(stream.fileno())
+        hz = resolve_frequency_hz(self.args)
+        metadata = {'source': self.args.source, 'receiver': self.args.receiver, 'mode': self.args.mode,
+                    'frequency_hz': hz, 'frequency_label': frequency_label(hz), 'sample_rate': self.rate,
+                    'started_utc': self.started, 'duration_sec': round(duration, 6),
+                    'squelch_threshold_rms': self.threshold, 'hang_time_ms': self.hang,
+                    'writer_pid': os.getpid(), 'close_reason': reason}
+        # Completed metadata FIRST; WAV is the worker's ready marker.
+        atomic_json(self.final.with_suffix('.json'), metadata)
+        archive_file(self.partial, self.final)
+        print(f'clip_writer: CLOSE {self.final} duration={duration:.3f}s reason={reason}', flush=True)
+
+    def process(self, data: bytes) -> None:
+        self.update_control()
+        rms = rms_s16le(data)
+        active = rms >= self.threshold
+        if self.args.verbose and time.monotonic() - self.last_verbose >= 1:
+            print(f'clip_writer: rms={rms} threshold={self.threshold} active={active}', flush=True)
+            self.last_verbose = time.monotonic()
+        if self.wf is None:
+            if not active:
+                self.pre_roll.append(data)
+                return
+            self.open()
+        # Never let a partial OS read or fast replay change hang-time semantics.
+        offset = 0
+        while offset < len(data):
+            if self.wf is None:
+                if not active:
+                    self.pre_roll.append(data[offset:])
+                    break
+                self.open()
+            remaining = max(1, int(self.maximum * self.rate)) - self.frames
+            count = min(len(data) - offset, max(1, remaining) * 2)
+            block = data[offset:offset + count]
+            self.wf.writeframesraw(block)
+            frames = len(block) // 2
+            self.frames += frames
+            self.silent_frames = 0 if active else self.silent_frames + frames
+            offset += count
+            if self.frames >= max(1, int(self.maximum * self.rate)):
+                self.close('max')
+            elif not active and self.silent_frames * 1000 >= self.hang * self.rate:
+                self.close('hang')
+
+    def feed(self, data: bytes, final: bool = False) -> None:
+        self.pending.extend(data)
+        size = max(2, self.rate * CHUNK_MS // 1000 * 2)
+        while len(self.pending) >= size:
+            block = bytes(self.pending[:size])
+            del self.pending[:size]
+            self.process(block)
+        if final:
+            complete = len(self.pending) // 2 * 2
+            if complete:
+                self.process(bytes(self.pending[:complete]))
+            if len(self.pending) % 2:
+                print('clip_writer: discarded one incomplete PCM byte at shutdown', file=sys.stderr)
+            self.pending.clear()
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--queue', default='runtime/queue')
+    p.add_argument('--tmp', default='runtime/tmp')
+    p.add_argument('--receiver', default='receiver1')
+    p.add_argument('--source', default='unknown')
+    p.add_argument('--mode', default='wbfm')
+    p.add_argument('--frequency', type=int)
+    p.add_argument('--frequency-hz', type=int)
+    p.add_argument('--frequency-mhz', type=float)
+    p.add_argument('--sample-rate', type=int, default=48000)
+    p.add_argument('--threshold', type=int, default=650)
+    p.add_argument('--threshold-control', default='')
+    p.add_argument('--hang-ms', type=int, default=1200)
+    p.add_argument('--min-sec', type=float, default=1.0)
+    p.add_argument('--max-sec', type=float, default=60.0)
+    p.add_argument('--pre-roll-ms', type=int, default=200)
+    p.add_argument('--verbose', action='store_true')
+    return p.parse_args()
 
 
 def main() -> int:
-    args = parse_args()
-    active_frequency_hz = resolve_frequency_hz(args)
-    active_frequency_label = frequency_label(active_frequency_hz)
-
-    queue_dir = Path(args.queue)
-    tmp_dir = Path(args.tmp)
-    queue_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    threshold_control = Path(args.threshold_control) if args.threshold_control else None
-    if threshold_control:
-        threshold_control.parent.mkdir(parents=True, exist_ok=True)
-        if not threshold_control.exists():
-            threshold_control.write_text(
-                json.dumps(
-                    {
-                        "threshold": int(args.threshold),
-                        "hang_ms": int(args.hang_ms),
-                        "min_sec": float(args.min_sec),
-                        "max_sec": float(args.max_sec),
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-    live_threshold = int(args.threshold)
-    live_hang_ms = int(args.hang_ms)
-    live_min_sec = float(args.min_sec)
-    live_max_sec = float(args.max_sec)
-    control_mtime_ns: int | None = None
-
-    bytes_per_chunk = int(args.sample_rate * (CHUNK_MS / 1000.0) * 2)
-
-    recording = False
-    wf: wave.Wave_write | None = None
-    tmp_wav: Path | None = None
-    tmp_json: Path | None = None
-    final_wav: Path | None = None
-    final_json: Path | None = None
-    started_utc: str | None = None
-    last_active: float | None = None
-    frames_written = 0
-    last_verbose = 0.0
-    last_control_check = 0.0
-
-    print(
-        "clip_writer: waiting for mono s16le PCM on stdin "
-        f"source={args.source} receiver={args.receiver} "
-        f"frequency_hz={active_frequency_hz} frequency={active_frequency_label} "
-        f"threshold={live_threshold}",
-        flush=True,
-    )
-    if threshold_control:
-        print(f"clip_writer: live threshold control={threshold_control}", flush=True)
-
-    while True:
-        data = os.read(0, bytes_per_chunk)
-        if not data:
-            time.sleep(0.05)
-            continue
-        if len(data) < 2:
-            continue
-
-        rms = audioop.rms(data, 2)
-        now = time.time()
-
-        if threshold_control and now - last_control_check >= 0.5:
-            old = (live_threshold, live_hang_ms, live_max_sec, live_min_sec)
-            live_threshold, live_hang_ms, live_max_sec, live_min_sec, control_mtime_ns, changed = maybe_update_live_settings(
-                control_path=threshold_control,
-                current_threshold=live_threshold,
-                current_hang_ms=live_hang_ms,
-                current_max_sec=live_max_sec,
-                current_min_sec=live_min_sec,
-                last_mtime_ns=control_mtime_ns,
-            )
-            if changed and old != (live_threshold, live_hang_ms, live_max_sec, live_min_sec):
-                print(
-                    "clip_writer: live settings "
-                    f"threshold={live_threshold} hang_ms={live_hang_ms} "
-                    f"min_sec={live_min_sec} max_sec={live_max_sec}",
-                    flush=True,
-                )
-            last_control_check = now
-
-        active = rms >= live_threshold
-
-        if args.verbose and now - last_verbose > 1.0:
-            print(
-                f"clip_writer: rms={rms} threshold={live_threshold} "
-                f"active={active} recording={recording}",
-                flush=True,
-            )
-            last_verbose = now
-
-        if active:
-            last_active = now
-
-        if active and not recording:
-            stamp = utc_stamp_for_filename()
-            started_utc = utc_iso()
-            safe_source = safe_token(args.source)
-            safe_receiver = safe_token(args.receiver)
-            safe_mode = safe_token(args.mode)
-            safe_freq = safe_token(active_frequency_label)
-            # Filename format is sortable and works when many receivers are running:
-            # time__source__receiver__frequency__mode__pid.wav
-            base = f"{stamp}__{safe_source}__{safe_receiver}__{safe_freq}__{safe_mode}__pid{os.getpid()}"
-            tmp_wav = tmp_dir / f"{base}.wav.part"
-            tmp_json = tmp_dir / f"{base}.json.part"
-            final_wav = queue_dir / f"{base}.wav"
-            final_json = queue_dir / f"{base}.json"
-
-            wf = open_wav(tmp_wav, args.sample_rate)
-            recording = True
-            frames_written = 0
-            print(f"clip_writer: OPEN {tmp_wav} rms={rms} threshold={live_threshold}", flush=True)
-
-        if not recording or wf is None:
-            continue
-
-        wf.writeframes(data)
-        frames_written += len(data) // 2
-        duration = frames_written / args.sample_rate
-
-        hang_expired = last_active is not None and ((now - last_active) * 1000.0 >= live_hang_ms)
-        max_expired = duration >= live_max_sec
-
-        if not (hang_expired or max_expired):
-            continue
-
-        wf.close()
-        wf = None
-        recording = False
-
-        assert tmp_wav is not None
-        assert final_wav is not None
-        assert started_utc is not None
-
-        if duration >= live_min_sec:
-            metadata = {
-                "receiver": args.receiver,
-                "source": args.source,
-                "frequency_hz": active_frequency_hz,
-                "frequency_label": active_frequency_label,
-                "mode": args.mode,
-                "sample_rate": args.sample_rate,
-                "started_utc": started_utc,
-                "duration_sec": round(duration, 3),
-                "squelch_threshold_rms": live_threshold,
-                "hang_time_ms": live_hang_ms,
-                "writer_pid": os.getpid(),
-            }
-            if tmp_json and final_json:
-                write_sidecar(tmp_json, metadata)
-                tmp_json.rename(final_json)
-            tmp_wav.rename(final_wav)
-            reason = "max" if max_expired else "hang"
-            print(f"clip_writer: CLOSE {final_wav} duration={duration:.2f}s reason={reason}", flush=True)
-        else:
-            tmp_wav.unlink(missing_ok=True)
-            if tmp_json:
-                tmp_json.unlink(missing_ok=True)
-            print(f"clip_writer: DROP short clip duration={duration:.2f}s", flush=True)
-
+    writer = ClipWriter(parse_args())
+    stopped = []
+    def stop(signum, frame):
+        stopped.append(signum)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, stop)
+    reason = 'eof'
+    print('clip_writer: waiting for mono s16le PCM on stdin', flush=True)
+    try:
+        while not stopped:
+            readable, _, _ = select.select([0], [], [], 0.2)
+            if not readable:
+                continue
+            data = os.read(0, 65536)
+            if not data:
+                break
+            writer.feed(data)
+        reason = 'signal' if stopped else 'eof'
+    finally:
+        writer.feed(b'', final=True)
+        writer.close(reason)
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

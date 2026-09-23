@@ -37,8 +37,8 @@ Options:
   --gain DB             Override SDR tuner gain. NFM default is higher than WBFM.
   --agc                 Do not pass a fixed -g gain to rtl_fm; allow tuner auto gain.
   --threshold RMS       Override clip_writer RMS threshold. NFM default is lower than WBFM.
-  --sample-rate HZ      Override rtl_fm output sample rate.
-  --audio-rate HZ       Override clip_writer WAV sample rate metadata. Defaults to sample-rate.
+  --sample-rate HZ      Override rtl_fm demodulation rate (-s).
+  --audio-rate HZ       Actual PCM output rate (-r) and WAV rate. WBFM default: 48000; NFM: sample-rate.
   --hang-ms MS          Override clip hang time.
   --calibrate           Always run signal calibration before starting.
   --no-calibrate        Skip signal calibration prompt.
@@ -89,7 +89,7 @@ fi
 
 read_config_value() {
   local expr="$1"
-  ${PY} - "$CONFIG" "$expr" <<'PY'
+  "${PY}" - "$CONFIG" "$expr" <<'PY'
 import json, sys
 path, expr = sys.argv[1], sys.argv[2]
 data = json.load(open(path))
@@ -102,7 +102,7 @@ PY
 
 receiver_value() {
   local key="$1"
-  ${PY} - "$CONFIG" "$RECEIVER" "$key" <<'PY'
+  "${PY}" - "$CONFIG" "$RECEIVER" "$key" <<'PY'
 import json, sys
 path, receiver_id, key = sys.argv[1], sys.argv[2], sys.argv[3]
 data = json.load(open(path))
@@ -116,7 +116,7 @@ PY
 
 parse_frequency_hz() {
   local freq="$1"
-  ${PY} - "$freq" <<'PY'
+  "${PY}" - "$freq" <<'PY'
 import sys
 text = sys.argv[1].strip().lower().replace('hz', '')
 mult = 1
@@ -138,7 +138,7 @@ PY
 
 format_rtl_frequency() {
   local freq_hz="$1"
-  ${PY} - "$freq_hz" <<'PY'
+  "${PY}" - "$freq_hz" <<'PY'
 import sys
 freq = int(sys.argv[1])
 if freq >= 1_000_000:
@@ -173,8 +173,8 @@ load_receiver_settings() {
     FREQ_HZ="$(parse_frequency_hz "${FREQUENCY_OVERRIDE}")"
     RTL_FREQ="$(format_rtl_frequency "${FREQ_HZ}")"
   else
-    FREQ_HZ="$(${PY} scripts/receiver_config.py --config "${CONFIG}" --receiver "${RECEIVER}" frequency-hz)"
-    RTL_FREQ="$(${PY} scripts/receiver_config.py --config "${CONFIG}" --receiver "${RECEIVER}" rtl-fm-frequency)"
+    FREQ_HZ="$("${PY}" scripts/receiver_config.py --config "${CONFIG}" --receiver "${RECEIVER}" frequency-hz)"
+    RTL_FREQ="$("${PY}" scripts/receiver_config.py --config "${CONFIG}" --receiver "${RECEIVER}" rtl-fm-frequency)"
   fi
 
   if [[ -n "${MODE_OVERRIDE}" ]]; then
@@ -187,7 +187,7 @@ load_receiver_settings() {
 }
 
 load_runtime_settings() {
-  PPM_ARGS="$(${PY} scripts/ppm_config.py --config "${CONFIG}" rtl-fm-args)"
+  PPM_ARGS="$("${PY}" scripts/ppm_config.py --config "${CONFIG}" rtl-fm-args)"
   PPM_VALUE="$(read_config_value "source.ppm_correction" 2>/dev/null || echo 0)"
   CONFIG_SAMPLE_RATE="$(read_config_value "source.sample_rate" 2>/dev/null || echo 240000)"
   CONFIG_HANG_MS="$(read_config_value "clip_writer.hang_time_ms" 2>/dev/null || echo 1200)"
@@ -206,6 +206,8 @@ load_runtime_settings() {
 
   if [[ -n "${AUDIO_RATE_OVERRIDE}" ]]; then
     AUDIO_RATE="${AUDIO_RATE_OVERRIDE}"
+  elif [[ "${CLIP_MODE}" == "wbfm" ]]; then
+    AUDIO_RATE="48000"
   else
     AUDIO_RATE="${SAMPLE_RATE}"
   fi
@@ -308,12 +310,23 @@ load_receiver_settings
 load_runtime_settings
 run_signal_calibration
 
+# rtl_fm's secondary resampler only supports downsampling. Never relabel PCM.
+"${PY}" - "${SAMPLE_RATE}" "${AUDIO_RATE}" <<'PYRATE'
+import sys
+try:
+    demod, audio = map(int, sys.argv[1:])
+except ValueError:
+    raise SystemExit('sample-rate and audio-rate must be integer Hz')
+if not 1000 <= audio <= min(demod, 384000):
+    raise SystemExit('require 1000 <= audio-rate <= sample-rate (audio-rate <= 384000)')
+PYRATE
+
 mkdir -p "${QUEUE_DIR}" "${TMP_DIR}"
 
 echo "receiver_launcher: source=${SOURCE} receiver=${RECEIVER} mode=${CLIP_MODE} rtl_fm_mode=${RTL_MODE} frequency_hz=${FREQ_HZ} rtl_fm_frequency=${RTL_FREQ} ppm=${PPM_ARGS} gain=${GAIN_LABEL} agc=${AGC} sample_rate=${SAMPLE_RATE} audio_rate=${AUDIO_RATE} threshold=${THRESHOLD} hang_ms=${HANG_MS}"
 
 # shellcheck disable=SC2086
-rtl_fm -M "${RTL_MODE}" -f "${RTL_FREQ}" -s "${SAMPLE_RATE}" "${GAIN_ARGS[@]}" ${PPM_ARGS} - | \
+rtl_fm -M "${RTL_MODE}" -f "${RTL_FREQ}" -s "${SAMPLE_RATE}" -r "${AUDIO_RATE}" "${GAIN_ARGS[@]}" ${PPM_ARGS} - | \
   "${PY}" scripts/clip_writer.py \
     --queue "${QUEUE_DIR}" \
     --tmp "${TMP_DIR}" \
