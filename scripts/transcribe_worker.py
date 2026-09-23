@@ -1,469 +1,305 @@
 #!/usr/bin/env python3
-"""Transcribe completed SDR WAV clips and publish transcript records.
+"""Speech-first worker. Durable raw results precede optional enrichment.
 
-The worker treats runtime/queue/*.wav as complete input files. It moves each file
-into runtime/processing, runs faster-whisper for speech-to-text, optionally asks
-an OpenAI-compatible model server such as LM Studio to clean up the rough
-transcript, optionally classifies CW/tone/spoken callsign evidence, writes
-JSON/JSONL outputs, updates persistent classification state, rebuilds the simple
-HTML page, then moves finished audio into runtime/done.
+Run enrichment_worker.py separately for queued CW/cleanup requests. One speech
+worker owns a runtime; kernel locks make interrupted processing safe to resume.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import math
-import re
-import shutil
-import subprocess
+import signal
+import sys
 import time
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import requests
-from faster_whisper import WhisperModel
+from pipeline_store import record_path, refresh_views
+from safe_runtime import archive_file, atomic_json, exclusive_lock, fsync_directory, positive_timeout, read_json, run_command, sha256
 
-CALLSIGN_RE = re.compile(r"\b(?:[AKNW][A-Z]?\d[A-Z]{1,3}|[A-Z]{1,2}\d[A-Z]{1,4})\b", re.IGNORECASE)
-CLEANUP_MODES = ["plain", "radio-log", "conservative"]
+# Import lazily so capture, CW and offline regression tests need no ASR runtime.
+WhisperModel = None
+ASR_OPTIONS = {'language': 'en', 'beam_size': 5, 'vad_filter': True}
+CLEANUP_MODES = ['plain', 'radio-log', 'conservative']
 
 
 def utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
 def normalize_lmstudio_url(host: str | None, port: int, url: str | None) -> str:
-    if url:
-        base = url.strip().rstrip("/")
-    else:
-        value = (host or "127.0.0.1").strip().rstrip("/")
-        if value.startswith("http://") or value.startswith("https://"):
-            base = value
-        else:
-            if ":" in value:
-                base = f"http://{value}"
-            else:
-                base = f"http://{value}:{port}"
-    if not base.endswith("/v1"):
-        base = f"{base}/v1"
-    return base
-
-
-def load_sidecar(wav_path: Path) -> dict[str, Any]:
-    sidecar = wav_path.with_suffix(".json")
-    if not sidecar.exists():
-        return {}
-    try:
-        return json.loads(sidecar.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
-def move_sidecar(src_wav: Path, dst_dir: Path) -> None:
-    sidecar = src_wav.with_suffix(".json")
-    if sidecar.exists():
-        shutil.move(str(sidecar), str(dst_dir / sidecar.name))
-
-
-def append_jsonl(path: Path, record: dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def rebuild_page(transcripts_dir: Path) -> None:
-    script_path = Path(__file__).with_name("build_transcript_page.py")
-    subprocess.run(["python3", str(script_path), "--transcripts", str(transcripts_dir)], check=False)
+    value = (url or host or '127.0.0.1').strip().rstrip('/')
+    if not value.startswith(('http://', 'https://')):
+        value = 'http://' + value + ('' if ':' in value else f':{port}')
+    return value if value.endswith('/v1') else value + '/v1'
 
 
 def normalize_mode_label(value: object) -> str:
-    text = str(value or "unknown_mode").lower().strip()
-    if text in {"fm", "nfm", "narrow", "narrowfm", "narrowband", "narrowbandfm"}:
-        return "nfm"
-    if text in {"wbfm", "wide", "widefm", "wideband", "widebandfm"}:
-        return "wbfm"
-    return text or "unknown_mode"
-
-
-def format_frequency(value: object) -> str:
-    try:
-        hz = int(float(value))
-    except (TypeError, ValueError):
-        return str(value or "unknown")
-    if hz >= 1_000_000:
-        return f"{hz / 1_000_000:.6f} MHz"
-    if hz >= 1_000:
-        return f"{hz / 1_000:.3f} kHz"
-    return f"{hz} Hz"
-
-
-def metadata_summary(metadata: dict[str, Any], classification: dict[str, Any] | None = None) -> dict[str, Any]:
-    classification = classification or {}
-    summary: dict[str, Any] = {
-        "source": metadata.get("source"),
-        "receiver": metadata.get("receiver"),
-        "frequency": metadata.get("frequency_label") or format_frequency(metadata.get("frequency_hz")),
-        "mode": metadata.get("mode"),
-        "started_utc": metadata.get("started_utc"),
-        "duration_sec": metadata.get("duration_sec"),
-    }
-    label_candidates = classification.get("label_candidates") or []
-    if label_candidates:
-        summary["label_candidates"] = [
-            {"label": item.get("label"), "type": item.get("type"), "confidence": item.get("confidence"), "source": item.get("source")}
-            for item in label_candidates[:5]
-        ]
-    tone = (classification.get("classification") or classification).get("tone_id") if isinstance(classification, dict) else None
-    cw = (classification.get("classification") or classification).get("cw_id") if isinstance(classification, dict) else None
-    if tone:
-        summary["tone_id"] = tone
-    if cw:
-        summary["cw_id"] = cw
-    return {k: v for k, v in summary.items() if v not in (None, "", [])}
-
-
-def cleanup_prompt(text: str, mode: str, metadata: dict[str, Any], classification: dict[str, Any] | None = None) -> str:
-    context = metadata_summary(metadata, classification)
-    raw = text.strip()
-    common_rules = """
-Core rules:
-- Preserve callsigns, names, frequencies, numbers, radio terms, and technical wording.
-- Do not invent missing words, speakers, locations, callsigns, or agencies.
-- If a word/phrase is uncertain, mark it as [unclear].
-- If the clip is mostly noise, tones, silence, or ASR garbage, say: [no reliable speech detected]
-- Remove obvious ASR filler/repetition caused by radio noise.
-- Return only the cleaned output; do not explain your process.
-""".strip()
-    if mode == "plain":
-        task = "Task: Clean this single radio transcription into readable text. Use normal punctuation and capitalization."
-    elif mode == "radio-log":
-        task = """
-Task: Format this single clip as a compact radio log entry.
-Preferred output format:
-[station/label or unknown] — cleaned transmission text
-Notes: short uncertainty note only if needed.
-Do not add timestamp/frequency unless the transmission text itself needs it; the web page already displays metadata.
-""".strip()
-    elif mode == "conservative":
-        task = "Task: Produce a conservative copy-edit only. Make the smallest possible changes and use [unclear] aggressively."
-    else:
-        raise ValueError(f"unknown cleanup mode: {mode}")
-    return f"""
-You are cleaning a short SDR/radio speech-to-text clip.
-
-{task}
-
-{common_rules}
-
-Clip metadata / classifier context:
-{json.dumps(context, indent=2, ensure_ascii=False)}
-
-Raw Whisper transcript:
-{raw}
-""".strip()
-
-
-def call_cleanup_model(text: str, base_url: str, model: str, timeout: int, mode: str = "radio-log", metadata: dict[str, Any] | None = None, classification: dict[str, Any] | None = None, max_tokens: int = 512) -> str:
-    prompt = cleanup_prompt(text, mode, metadata or {}, classification)
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You clean up SDR/radio speech-to-text transcripts conservatively. You never invent details."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.05,
-        "max_tokens": max_tokens,
-    }
-    response = requests.post(f"{base_url.rstrip('/')}/chat/completions", json=payload, timeout=timeout)
-    if response.status_code >= 400:
-        raise RuntimeError(f"cleanup model failed: HTTP {response.status_code} {response.reason}: {response.text[:2000]}")
-    return response.json()["choices"][0]["message"]["content"].strip()
-
-
-def transcribe_file(model: WhisperModel, wav_path: Path) -> tuple[str, list[dict[str, Any]], Any]:
-    segments, info = model.transcribe(str(wav_path), language="en", beam_size=5, vad_filter=True)
-    parts: list[str] = []
-    segment_data: list[dict[str, Any]] = []
-    for segment in segments:
-        text = segment.text.strip()
-        if text:
-            parts.append(text)
-        segment_data.append({"start": round(float(segment.start), 3), "end": round(float(segment.end), 3), "text": text})
-    return " ".join(parts).strip(), segment_data, info
-
-
-def spoken_callsign_candidates(*texts: str) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for text in texts:
-        for match in CALLSIGN_RE.finditer(text or ""):
-            callsign = match.group(0).upper()
-            if callsign in seen:
-                continue
-            seen.add(callsign)
-            candidates.append({"type": "spoken_callsign", "label": callsign, "value": callsign, "confidence": 0.55, "source": "transcript_regex"})
-    return candidates
-
-
-def run_clip_classifier(wav_path: Path, cw_external_command: str = "", cw_external_timeout: int = 20) -> dict[str, Any]:
-    script_path = Path(__file__).with_name("clip_classifier.py")
-    cmd = ["python3", str(script_path), str(wav_path)]
-    if cw_external_command:
-        cmd.extend(["--cw-external-command", cw_external_command, "--cw-external-timeout", str(cw_external_timeout)])
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        return {"enabled": True, "error": result.stderr.strip() or f"classifier exited {result.returncode}", "label_candidates": []}
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        return {"enabled": True, "error": str(exc), "label_candidates": []}
-
-
-def merge_label_candidates(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for group in groups:
-        for candidate in group:
-            key = (str(candidate.get("type", "")), str(candidate.get("label", "")))
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(candidate)
-    merged.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
-    return merged
-
-
-def choose_label(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    if not candidates:
-        return {"label": None, "confidence": 0.0, "source": None}
-    best = candidates[0]
-    return {"label": best.get("label"), "confidence": best.get("confidence", 0.0), "source": best.get("source"), "type": best.get("type")}
-
-
-def load_classification_state(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"version": 2, "created_utc": utc_iso(), "updated_utc": None, "contexts": {}}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        data.setdefault("version", 2)
-        data.setdefault("contexts", {})
-        return data
-    except json.JSONDecodeError:
-        backup = path.with_suffix(path.suffix + f".bad-{int(time.time())}")
-        path.rename(backup)
-        return {"version": 2, "created_utc": utc_iso(), "updated_utc": None, "contexts": {}, "warning": f"Previous state was invalid JSON and was moved to {backup.name}"}
-
-
-def save_classification_state(path: Path, state: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def context_key(record: dict[str, Any]) -> str:
-    source = record.get("source") or "unknown_source"
-    receiver = record.get("receiver") or "unknown_receiver"
-    mode = normalize_mode_label(record.get("mode"))
-    frequency = record.get("frequency_hz") or "unknown_frequency"
-    return f"{source}/{receiver}/{mode}@{frequency}Hz"
-
-
-def evidence_weight(candidate: dict[str, Any]) -> float:
-    base = float(candidate.get("confidence", 0.0) or 0.0)
-    kind = candidate.get("type")
-    source = candidate.get("source")
-    multiplier = 1.0
-    if kind == "cw_callsign" or source in {"cw_audio_decode", "external_cw_decoder"}:
-        multiplier = 1.7
-    elif kind == "spoken_callsign":
-        multiplier = 1.0
-    elif kind == "tone_id_frequency":
-        multiplier = 0.65
-    return max(0.05, min(2.0, base * multiplier))
-
-
-def stable_confidence(count: int, weighted_score: float, best_seen_confidence: float) -> float:
-    repeat_component = 1.0 - math.exp(-max(0.0, weighted_score) / 3.0)
-    count_component = 1.0 - math.exp(-max(0, count) / 5.0)
-    confidence = (0.55 * repeat_component) + (0.30 * count_component) + (0.15 * best_seen_confidence)
-    return round(max(0.0, min(0.99, confidence)), 3)
-
-
-def update_classification_state(path: Path, record: dict[str, Any]) -> dict[str, Any]:
-    state = load_classification_state(path)
-    state["version"] = max(int(state.get("version", 1)), 2)
-    now = utc_iso()
-    key = context_key(record)
-    contexts = state.setdefault("contexts", {})
-    context = contexts.setdefault(key, {
-        "source": record.get("source"),
-        "receiver": record.get("receiver"),
-        "mode": normalize_mode_label(record.get("mode")),
-        "frequency_hz": record.get("frequency_hz"),
-        "frequency_label": record.get("frequency_label"),
-        "first_seen_utc": now,
-        "last_seen_utc": None,
-        "clip_count": 0,
-        "evidence": {},
-        "promoted_label": None,
-        "recent_files": [],
-    })
-    context["last_seen_utc"] = now
-    context["clip_count"] = int(context.get("clip_count", 0)) + 1
-    context["source"] = record.get("source", context.get("source"))
-    context["receiver"] = record.get("receiver", context.get("receiver"))
-    context["mode"] = normalize_mode_label(record.get("mode"))
-    context["frequency_hz"] = record.get("frequency_hz", context.get("frequency_hz"))
-    context["frequency_label"] = record.get("frequency_label", context.get("frequency_label"))
-    recent_files = context.setdefault("recent_files", [])
-    recent_files.append(record.get("file"))
-    context["recent_files"] = [item for item in recent_files if item][-20:]
-    evidence = context.setdefault("evidence", {})
-    for candidate in record.get("label_candidates") or []:
-        label = str(candidate.get("label") or "").strip()
-        if not label:
-            continue
-        item = evidence.setdefault(label, {"label": label, "count": 0, "weighted_score": 0.0, "best_seen_confidence": 0.0, "sources": {}, "types": {}, "first_seen_utc": now, "last_seen_utc": None, "last_file": None, "stable_confidence": 0.0})
-        item["count"] = int(item.get("count", 0)) + 1
-        item["last_seen_utc"] = now
-        item["last_file"] = record.get("file")
-        candidate_conf = float(candidate.get("confidence", 0.0) or 0.0)
-        item["best_seen_confidence"] = max(float(item.get("best_seen_confidence", 0.0)), candidate_conf)
-        item["weighted_score"] = round(float(item.get("weighted_score", 0.0)) + evidence_weight(candidate), 3)
-        src = str(candidate.get("source") or "unknown")
-        kind = str(candidate.get("type") or "unknown")
-        item.setdefault("sources", {})[src] = int(item.setdefault("sources", {}).get(src, 0)) + 1
-        item.setdefault("types", {})[kind] = int(item.setdefault("types", {}).get(kind, 0)) + 1
-        item["stable_confidence"] = stable_confidence(int(item.get("count", 0)), float(item.get("weighted_score", 0.0)), float(item.get("best_seen_confidence", 0.0)))
-    ranked = sorted(evidence.values(), key=lambda item: (float(item.get("stable_confidence", 0.0)), float(item.get("weighted_score", 0.0)), int(item.get("count", 0))), reverse=True)
-    if ranked:
-        best = ranked[0]
-        context["promoted_label"] = {"label": best.get("label"), "stable_confidence": best.get("stable_confidence", 0.0), "count": best.get("count", 0), "weighted_score": best.get("weighted_score", 0.0), "sources": best.get("sources", {}), "updated_utc": now}
-    state["updated_utc"] = now
-    save_classification_state(path, state)
-    return {"context_key": key, "promoted_label": context.get("promoted_label"), "clip_count": context.get("clip_count", 0), "state_path": str(path)}
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Watch runtime/queue and transcribe completed WAV clips")
-    parser.add_argument("--queue", default="runtime/queue")
-    parser.add_argument("--processing", default="runtime/processing")
-    parser.add_argument("--done", default="runtime/done")
-    parser.add_argument("--failed", default="runtime/failed")
-    parser.add_argument("--transcripts", default="runtime/transcripts")
-    parser.add_argument("--classification-state", default="runtime/classification_state.json")
-    parser.add_argument("--whisper-model", default="small.en")
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--compute-type", default="int8")
-    parser.add_argument("--lmstudio-host", default="127.0.0.1")
-    parser.add_argument("--lmstudio-port", type=int, default=1234)
-    parser.add_argument("--lmstudio-url", default=None)
-    parser.add_argument("--cleanup-model", default="bingbangboom/Qwen3508B-transcriber-15k-03")
-    parser.add_argument("--cleanup-mode", choices=CLEANUP_MODES, default="radio-log")
-    parser.add_argument("--cleanup-max-tokens", type=int, default=512)
-    parser.add_argument("--cleanup-timeout", type=int, default=120)
-    parser.add_argument("--no-cleanup", action="store_true")
-    parser.add_argument("--enable-classifier", action="store_true")
-    parser.add_argument("--classify-modes", default="nfm", help="Comma list of modes to classify, or all. Default: nfm")
-    parser.add_argument("--cw-external-command", default="")
-    parser.add_argument("--cw-external-timeout", type=int, default=20)
-    parser.add_argument("--poll-seconds", type=float, default=2.0)
-    return parser.parse_args()
+    mode = str(value or 'unknown_mode').lower().strip()
+    if mode in {'fm', 'nfm', 'narrow', 'narrowfm', 'narrowband', 'narrowbandfm'}:
+        return 'nfm'
+    if mode in {'wbfm', 'wide', 'widefm', 'wideband', 'widebandfm'}:
+        return 'wbfm'
+    return mode
 
 
 def mode_allowed(mode: object, allowed: str) -> bool:
-    allowed = (allowed or "nfm").strip().lower()
-    if allowed == "all":
-        return True
-    allowed_modes = {normalize_mode_label(item.strip()) for item in allowed.split(",") if item.strip()}
-    return normalize_mode_label(mode) in allowed_modes
+    return allowed.strip().lower() == 'all' or normalize_mode_label(mode) in {
+        normalize_mode_label(x) for x in allowed.split(',')}
+
+
+def load_sidecar(wav_path: Path) -> dict[str, Any]:
+    path = wav_path.with_suffix('.json')
+    if not path.exists():
+        return {'metadata_warning': 'capture sidecar is missing'}
+    try:
+        return read_json(path)
+    except (ValueError, OSError) as exc:
+        return {'metadata_warning': str(exc)}
+
+
+def transcribe_file(model: Any, wav_path: Path) -> tuple[str, list[dict[str, Any]], Any]:
+    segments, info = model.transcribe(str(wav_path), **ASR_OPTIONS)
+    parts, details = [], []
+    for segment in segments:  # faster-whisper inference occurs during iteration.
+        text = segment.text.strip()
+        if text:
+            parts.append(text)
+        item = {'start': round(float(segment.start), 3), 'end': round(float(segment.end), 3), 'text': text}
+        for name in ('avg_logprob', 'no_speech_prob', 'compression_ratio'):
+            value = getattr(segment, name, None)
+            if isinstance(value, (float, int)) and math.isfinite(value):
+                item[name] = value
+        details.append(item)
+    return ' '.join(parts).strip(), details, info
+
+
+def runtime_versions() -> dict[str, str]:
+    result = {'python': sys.version.split()[0]}
+    for name in ('faster-whisper', 'ctranslate2', 'av', 'onnxruntime', 'numpy'):
+        try:
+            result[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            result[name] = 'not installed'
+    return result
+
+
+def call_cleanup_model(text: str, base_url: str, model: str, timeout: float,
+                       mode: str = 'radio-log', metadata: dict | None = None,
+                       classification: dict | None = None, max_tokens: int = 512) -> str:
+    import requests
+    if mode not in CLEANUP_MODES:
+        raise ValueError('invalid cleanup mode')
+    # Do not seed cleaned speech with uncertain CW identities or past labels.
+    prompt = ('Conservatively copy-edit this radio transcript. Preserve callsigns, names, '
+              'frequencies, numbers and technical wording. Never invent details. Mark uncertainty '
+              'as [unclear]. For noise/ASR garbage use [no reliable speech detected]. '
+              'Return only the cleaned text. Formatting mode: ' + mode + '\n\n' + text)
+    response = requests.post(base_url.rstrip('/') + '/chat/completions', json={
+        'model': model, 'temperature': 0.05, 'max_tokens': max_tokens,
+        'messages': [{'role': 'system', 'content': 'Copy-edit conservatively; never invent details.'},
+                     {'role': 'user', 'content': prompt}]}, timeout=positive_timeout(timeout))
+    response.raise_for_status()
+    value = response.json()['choices'][0]['message']['content']
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('cleanup returned no usable text')
+    return value.strip()
+
+
+def run_clip_classifier(wav_path: Path, cw_external_command: str = '', cw_external_timeout: float = 20) -> dict:
+    """Compatibility helper; the speech main loop deliberately never calls it."""
+    command = [sys.executable, str(Path(__file__).with_name('clip_classifier.py')), str(wav_path),
+               '--cw-internal-timeout', str(cw_external_timeout),
+               '--cw-external-timeout', str(cw_external_timeout)]
+    if cw_external_command:
+        command += ['--cw-external-command', cw_external_command]
+    result = run_command(command, positive_timeout(cw_external_timeout) + 5)
+    if result['error']:
+        return {'enabled': True, 'error': result['error'], 'label_candidates': []}
+    try:
+        value = json.loads(result['stdout'])
+        if not isinstance(value, dict):
+            raise ValueError('classifier must return an object')
+        return value
+    except ValueError as exc:
+        return {'enabled': True, 'error': str(exc), 'label_candidates': []}
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    for name in ('queue', 'processing', 'done', 'failed', 'transcripts'):
+        p.add_argument('--' + name, default='runtime/' + name)
+    p.add_argument('--classification-state', default='runtime/classification_state.json',
+                   help='Legacy option accepted; automatic station-label promotion is disabled.')
+    p.add_argument('--whisper-model', default='small.en')
+    p.add_argument('--model-revision', default=None, help='Optional operator-supplied model artifact revision for provenance')
+    p.add_argument('--device', default='cpu')
+    p.add_argument('--compute-type', default='int8')
+    p.add_argument('--lmstudio-host', default='127.0.0.1')
+    p.add_argument('--lmstudio-port', type=int, default=1234)
+    p.add_argument('--lmstudio-url')
+    p.add_argument('--cleanup-model', default='bingbangboom/Qwen3508B-transcriber-15k-03')
+    p.add_argument('--cleanup-mode', choices=CLEANUP_MODES, default='radio-log')
+    p.add_argument('--cleanup-max-tokens', type=int, default=512)
+    p.add_argument('--cleanup-timeout', type=float, default=120)
+    p.add_argument('--enable-cleanup', action='store_true', help='Queue cleanup for the separate enrichment worker')
+    p.add_argument('--no-cleanup', action='store_true', help='Compatibility flag; overrides --enable-cleanup')
+    p.add_argument('--enable-classifier', action='store_true', help='Queue CW for the separate enrichment worker')
+    p.add_argument('--classify-modes', default='nfm')
+    p.add_argument('--cw-external-command', default='')
+    p.add_argument('--cw-external-timeout', type=float, default=20)
+    p.add_argument('--cw-internal-timeout', type=float, default=20)
+    p.add_argument('--poll-seconds', type=float, default=2)
+    p.add_argument('--once', action='store_true', help='Drain currently available work and exit')
+    return p.parse_args()
+
+
+def enrichment_request(args: argparse.Namespace, mode: object) -> dict[str, Any]:
+    classifier = args.enable_classifier and mode_allowed(mode, args.classify_modes)
+    cleanup = args.enable_cleanup and not args.no_cleanup
+    return {'status': 'pending' if classifier or cleanup else 'disabled',
+            'classifier': bool(classifier), 'cleanup': bool(cleanup),
+            'cw_external_command': args.cw_external_command,
+            'cw_external_timeout': args.cw_external_timeout, 'cw_internal_timeout': args.cw_internal_timeout,
+            'cleanup_endpoint': normalize_lmstudio_url(args.lmstudio_host, args.lmstudio_port, args.lmstudio_url),
+            'cleanup_model': args.cleanup_model, 'cleanup_mode': args.cleanup_mode,
+            'cleanup_timeout': args.cleanup_timeout, 'cleanup_max_tokens': args.cleanup_max_tokens}
+
+
+def finish_checkpoint(checkpoint: Path, args: argparse.Namespace) -> None:
+    record = read_json(checkpoint)
+    filename = record['file']
+    record_path(Path(args.done), filename)  # Validate before constructing paths.
+    proc = Path(args.processing) / filename
+    target = Path(record['audio_file'])
+    if target.parent.resolve() not in {Path(args.done).resolve(), Path(args.failed).resolve()} or target.name != filename:
+        raise ValueError('checkpoint archive path does not match configured runtime')
+    if proc.exists():
+        archive_file(proc, target)
+    elif not target.exists():
+        raise FileNotFoundError(f'checkpoint audio missing: {filename}')
+    sidecar = proc.with_suffix('.json')
+    if sidecar.exists():
+        archive_file(sidecar, target.with_suffix('.json'))
+    # This ready marker is only visible to enrichment after the audio is archived.
+    canonical = record_path(Path(args.done), filename)
+    if canonical.exists():
+        current = read_json(canonical)
+        if any(current.get(k) != record.get(k) for k in ('file', 'raw_text', 'segments', 'audio_sha256')):
+            raise ValueError('existing record disagrees with checkpoint; refusing overwrite')
+        # Enrichment may have advanced the record after its initial publication.
+        checkpoint.unlink()
+        fsync_directory(checkpoint.parent)
+    else:
+        archive_file(checkpoint, canonical)
+    refresh_views(Path(args.done), Path(args.transcripts))
+
+
+def process_clip(wav: Path, model: Any, args: argparse.Namespace) -> None:
+    proc = Path(args.processing) / wav.name
+    canonical = record_path(Path(args.done), wav.name)
+    if canonical.exists():
+        previous = read_json(canonical)
+        if previous.get('audio_sha256') != sha256(wav):
+            raise ValueError('duplicate WAV basename has different content; refusing overwrite')
+        target = Path(previous['audio_file'])
+        if target.parent.resolve() not in {Path(args.done).resolve(), Path(args.failed).resolve()} or target.name != wav.name:
+            raise ValueError('previous archive location is outside configured runtime')
+        archive_file(wav, target)
+        if wav.with_suffix('.json').exists():
+            archive_file(wav.with_suffix('.json'), target.with_suffix('.json'))
+        refresh_views(Path(args.done), Path(args.transcripts))
+        return
+    if wav != proc:
+        archive_file(wav, proc)
+        sidecar = wav.with_suffix('.json')
+        if sidecar.exists():
+            archive_file(sidecar, proc.with_suffix('.json'))
+    # Recover metadata if a crash happened between the two claim operations.
+    queued_metadata = Path(args.queue) / proc.with_suffix('.json').name
+    if not proc.with_suffix('.json').exists() and queued_metadata.exists():
+        archive_file(queued_metadata, proc.with_suffix('.json'))
+    checkpoint = proc.with_suffix('.transcript.json')
+    if checkpoint.exists():
+        finish_checkpoint(checkpoint, args)
+        return
+    metadata = load_sidecar(proc)
+    start = time.monotonic()
+    record = {**metadata, 'file': proc.name, 'created_utc': utc_iso(), 'raw_text': '', 'text': '',
+              'segments': [], 'label_candidates': [], 'label': {'label': None, 'confidence': None},
+              'classification': {'enabled': False, 'label_candidates': []}}
+    try:
+        with wave.open(str(proc), 'rb') as wf:
+            record['duration_sec'] = wf.getnframes() / wf.getframerate()
+            record['audio_format'] = {'sample_rate': wf.getframerate(), 'channels': wf.getnchannels(),
+                                      'sample_width': wf.getsampwidth()}
+        record['audio_sha256'] = sha256(proc)
+        raw, segments, info = transcribe_file(model, proc)
+        record.update(raw_text=raw, text=raw, segments=segments, speech_status='complete',
+                      language=getattr(info, 'language', None),
+                      language_probability=getattr(info, 'language_probability', None),
+                      asr={'model': args.whisper_model, 'model_revision': args.model_revision,
+                           'device': args.device, 'compute_type': args.compute_type,
+                           'options': ASR_OPTIONS, 'versions': runtime_versions(),
+                           'elapsed_seconds': round(time.monotonic() - start, 3)},
+                      enrichment=enrichment_request(args, metadata.get('mode')))
+        destination = Path(args.done)
+    except Exception as exc:
+        record.update(error=str(exc), speech_status='failed', enrichment={'status': 'disabled'})
+        destination = Path(args.failed)
+    record['audio_file'] = str((destination / proc.name).resolve())
+    # No renderer, classifier, cleanup server, or archive movement precedes this.
+    # Disk errors propagate: never erase the WAV or claim a durable success.
+    atomic_json(checkpoint, record)
+    finish_checkpoint(checkpoint, args)
+    print(f"worker: {record['speech_status']} {proc.name}", flush=True)
 
 
 def main() -> int:
     args = parse_args()
-    queue = Path(args.queue)
-    processing = Path(args.processing)
-    done = Path(args.done)
-    failed = Path(args.failed)
-    transcripts = Path(args.transcripts)
-    classification_state_path = Path(args.classification_state)
-    lmstudio_url = normalize_lmstudio_url(args.lmstudio_host, args.lmstudio_port, args.lmstudio_url)
-    for directory in [queue, processing, done, failed, transcripts, classification_state_path.parent]:
-        directory.mkdir(parents=True, exist_ok=True)
-    jsonl_path = transcripts / "index.jsonl"
-    print(f"worker: loading faster-whisper model {args.whisper_model}", flush=True)
-    whisper = WhisperModel(args.whisper_model, device=args.device, compute_type=args.compute_type)
-    rebuild_page(transcripts)
-    print("worker: watching queue", flush=True)
-    if args.no_cleanup:
-        print("worker: cleanup disabled", flush=True)
-    else:
-        print(f"worker: cleanup endpoint {lmstudio_url} model={args.cleanup_model} mode={args.cleanup_mode}", flush=True)
-    if args.enable_classifier:
-        print(f"worker: classifier enabled state={classification_state_path} classify_modes={args.classify_modes}", flush=True)
-    while True:
-        wavs = sorted(queue.glob("*.wav"))
-        if not wavs:
-            time.sleep(args.poll_seconds)
-            continue
-        wav = wavs[0]
-        proc = processing / wav.name
-        sidecar_metadata: dict[str, Any] = {}
-        try:
-            sidecar_metadata = load_sidecar(wav)
-            shutil.move(str(wav), str(proc))
-            move_sidecar(wav, processing)
-            print(f"worker: transcribing {proc.name}", flush=True)
-            raw_text, segments, info = transcribe_file(whisper, proc)
-            clip_mode = normalize_mode_label(sidecar_metadata.get("mode"))
-            do_classifier = bool(args.enable_classifier and mode_allowed(clip_mode, args.classify_modes))
-            classification: dict[str, Any] = {"enabled": False, "skipped": None, "label_candidates": []}
-            if do_classifier:
-                classification = run_clip_classifier(proc, args.cw_external_command, args.cw_external_timeout)
-            elif args.enable_classifier:
-                classification = {"enabled": False, "skipped": f"mode {clip_mode} not in classify_modes={args.classify_modes}", "label_candidates": []}
-            cleanup_error = None
-            if args.no_cleanup or not raw_text:
-                clean_text = raw_text
-            else:
-                try:
-                    clean_text = call_cleanup_model(raw_text, lmstudio_url, args.cleanup_model, args.cleanup_timeout, mode=args.cleanup_mode, metadata=sidecar_metadata, classification=classification, max_tokens=args.cleanup_max_tokens)
-                except Exception as exc:
-                    cleanup_error = str(exc)
-                    clean_text = raw_text
-            spoken_candidates = spoken_callsign_candidates(raw_text, clean_text) if do_classifier else []
-            label_candidates = merge_label_candidates(classification.get("label_candidates", []), spoken_candidates)
-            label = choose_label(label_candidates)
-            duration = sidecar_metadata.get("duration_sec", getattr(info, "duration", None))
-            record: dict[str, Any] = {**sidecar_metadata, "file": proc.name, "created_utc": utc_iso(), "duration_sec": duration, "language": getattr(info, "language", None), "language_probability": getattr(info, "language_probability", None), "raw_text": raw_text, "text": clean_text, "segments": segments, "cleanup_model": None if args.no_cleanup else args.cleanup_model, "cleanup_endpoint": None if args.no_cleanup else lmstudio_url, "cleanup_mode": None if args.no_cleanup else args.cleanup_mode, "cleanup_error": cleanup_error, "classification": classification, "label_candidates": label_candidates, "label": label}
-            if do_classifier:
-                record["classification_state"] = update_classification_state(classification_state_path, record)
-                promoted = (record["classification_state"].get("promoted_label") or {})
-                if promoted.get("label"):
-                    record["stable_label"] = promoted
-            output_json = done / f"{proc.stem}.transcript.json"
-            output_json.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
-            append_jsonl(jsonl_path, record)
-            rebuild_page(transcripts)
-            shutil.move(str(proc), str(done / proc.name))
-            move_sidecar(proc, done)
-            print(f"worker: done {proc.name}", flush=True)
-        except Exception as exc:
-            print(f"worker: FAILED {wav.name}: {exc}", flush=True)
-            error_record = {**sidecar_metadata, "file": wav.name, "created_utc": utc_iso(), "text": "", "raw_text": "", "error": str(exc)}
-            append_jsonl(jsonl_path, error_record)
-            rebuild_page(transcripts)
-            try:
-                if proc.exists():
-                    shutil.move(str(proc), str(failed / proc.name))
-                    move_sidecar(proc, failed)
-                elif wav.exists():
-                    shutil.move(str(wav), str(failed / wav.name))
-                    move_sidecar(wav, failed)
-            except Exception:
-                pass
+    for timeout in (args.cw_internal_timeout, args.cw_external_timeout, args.cleanup_timeout, args.poll_seconds):
+        positive_timeout(timeout)
+    for name in ('queue', 'processing', 'done', 'failed', 'transcripts'):
+        setattr(args, name, str(Path(getattr(args, name)).resolve()))
+        Path(getattr(args, name)).mkdir(parents=True, exist_ok=True)
+    devices = {Path(getattr(args, name)).stat().st_dev for name in ('queue', 'processing', 'done', 'failed')}
+    if len(devices) != 1:
+        raise ValueError('queue, processing, done and failed must share a filesystem')
+    if len({args.queue, args.processing, args.done, args.failed}) != 4:
+        raise ValueError('queue, processing, done and failed must be distinct directories')
+    # Also share an ASR/enrichment namespace lock to prevent mismatched --processing
+    # directories from starting two publishers into one archive.
+    with exclusive_lock(Path(args.queue) / '.speech.lock'), exclusive_lock(Path(args.done) / '.speech.lock'), exclusive_lock(Path(args.processing) / '.worker.lock'):
+        refresh_views(Path(args.done), Path(args.transcripts))
+        # Durable checkpoints do not require loading the model to recover.
+        for checkpoint in sorted(Path(args.processing).glob('*.transcript.json')):
+            finish_checkpoint(checkpoint, args)
+        model_class = WhisperModel
+        if model_class is None:
+            from faster_whisper import WhisperModel as model_class
+        print(f'worker: loading {args.whisper_model} ({args.device}/{args.compute_type})', flush=True)
+        model = model_class(args.whisper_model, device=args.device, compute_type=args.compute_type)
+        if args.enable_classifier or (args.enable_cleanup and not args.no_cleanup):
+            print('worker: optional jobs queued; run scripts/enrichment_worker.py with matching --done and --transcripts', flush=True)
+        stopped = []
+        def stop(signum, frame):
+            stopped.append(signum)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, stop)
+        while not stopped:
+            wavs = sorted(Path(args.processing).glob('*.wav')) or sorted(Path(args.queue).glob('*.wav'))
+            if not wavs:
+                if args.once:
+                    break
+                time.sleep(args.poll_seconds)
+                continue
+            process_clip(wavs[0], model, args)
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

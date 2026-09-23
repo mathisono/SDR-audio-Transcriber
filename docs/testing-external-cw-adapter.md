@@ -1,176 +1,70 @@
-# Testing the External CW Adapter
+# Testing an external CW decoder
 
-This guide is for testing the parallel CW path without disrupting the normal Whisper transcription workflow.
+The adapter is **not** MorseAngel inference. It accepts an actual one-shot
+command supplied with `--command` or `MORSEANGEL_COMMAND`. Without one, it returns
+`decoded: false`, empty text/callsigns, and a configuration error.
 
-## Current status
-
-The live worker already supports an external CW decoder through:
-
-```bash
---cw-external-command
---cw-external-timeout
-```
-
-The committed adapter shim is:
-
-```text
-scripts/morseangel_adapter.py
-```
-
-It is a stable command target for the pipeline. It does **not** assume a confirmed MorseAngel command-line interface yet. Instead, it can wrap any external decoder command once that command is known.
-
-## Safe wiring test
-
-This command verifies that the adapter exists and returns normalized JSON. It will not create false CW text because no decoder command is configured:
+## Wiring check (not a decode-accuracy test)
 
 ```bash
 .venv/bin/python3 scripts/morseangel_adapter.py \
-  --input runtime/done/some_repeater_clip.wav \
-  --json \
-  --pretty
+  --input /path/to/known-id.wav --json --pretty
 ```
 
-Expected behavior when no command is configured:
+An unconfigured adapter exits 2. Diagnostic JSON, filenames and `message`
+fields never become decoded text.
 
-```json
-{
-  "engine": "morseangel-adapter",
-  "decoded": false,
-  "text": "",
-  "callsigns": [],
-  "error": "no MorseAngel command configured; pass --command or set MORSEANGEL_COMMAND"
-}
-```
+## Use a configured backend
 
-The adapter exits non-zero in this case, but prints no decoded CW text unless a decoder actually succeeds. That prevents accidental bad classifier evidence.
-
-## Test the classifier hook
-
-Run the existing classifier with the adapter as an external decoder:
-
-```bash
-.venv/bin/python3 scripts/clip_classifier.py \
-  runtime/done/some_repeater_clip.wav \
-  --cw-external-command ".venv/bin/python3 scripts/morseangel_adapter.py --input {wav}" \
-  --cw-external-timeout 30 \
-  --pretty
-```
-
-Expected result before MorseAngel is configured:
-
-- Internal DSP CW decoder still runs as the baseline.
-- External decoder section should show an error or no external text.
-- No fake external CW label candidates should be added.
-
-## Test the full live worker
-
-Use the normal worker command, but add the external CW adapter hook:
-
-```bash
-.venv/bin/python3 scripts/transcribe_worker.py \
-  --whisper-model small.en \
-  --device cpu \
-  --compute-type int8 \
-  --no-cleanup \
-  --enable-classifier \
-  --classify-modes nfm \
-  --cw-external-command ".venv/bin/python3 scripts/morseangel_adapter.py --input {wav}" \
-  --cw-external-timeout 30
-```
-
-This keeps the normal flow:
-
-```text
-completed WAV clip
-  -> faster-whisper speech transcription
-  -> internal classifier baseline
-  -> external CW adapter hook
-  -> merged label candidates
-  -> classification_state.json
-  -> transcript pages
-```
-
-## Configure an actual CW decoder command
-
-Once the MorseAngel or CW model invocation is confirmed, use either `--command` inside the adapter command:
-
-```bash
-.venv/bin/python3 scripts/clip_classifier.py \
-  runtime/done/some_repeater_clip.wav \
-  --cw-external-command ".venv/bin/python3 scripts/morseangel_adapter.py --input {wav} --command 'ACTUAL_DECODER_COMMAND --input {wav}'" \
-  --cw-external-timeout 30 \
-  --pretty
-```
-
-Or set an environment variable before starting the worker:
+Substitute your backend's documented invocation; `ACTUAL_DECODER_COMMAND` below
+is a placeholder, not an installed program:
 
 ```bash
 export MORSEANGEL_COMMAND='ACTUAL_DECODER_COMMAND --input {wav}'
-
-.venv/bin/python3 scripts/transcribe_worker.py \
-  --whisper-model small.en \
-  --device cpu \
-  --compute-type int8 \
-  --no-cleanup \
-  --enable-classifier \
-  --classify-modes nfm \
-  --cw-external-command ".venv/bin/python3 scripts/morseangel_adapter.py --input {wav}" \
-  --cw-external-timeout 30
+.venv/bin/python3 scripts/clip_classifier.py /path/to/known-id.wav \
+  --cw-external-command '.venv/bin/python3 scripts/morseangel_adapter.py --input {wav} --json' \
+  --cw-internal-timeout 20 --cw-external-timeout 30 --pretty
 ```
 
-The adapter accepts either plain decoded text on stdout:
+For the live speech worker, pass the same `--cw-external-command` and enable
+`--enable-classifier`. Run `enrichment_worker.py` in a separate process from the
+same repository root and environment. If the adapter uses an environment
+variable, the sidecar must inherit it too.
+
+## Output contract
+
+A successful command must exit **0** and write only decoded text to stdout:
 
 ```text
-CQ CQ DE KJ6DZB
+DE KJ6DZB
 ```
 
-or JSON stdout:
+Or a JSON object:
 
 ```json
-{
-  "text": "CQ CQ DE KJ6DZB",
-  "confidence": 0.82,
-  "wpm": 18
-}
+{"decoded": true, "text": "DE KJ6DZB", "confidence": 0.82, "wpm": 18}
 ```
 
-## Save normalized CW JSON sidecars
+`decoded: false`, a nonempty `error`, or a nonzero exit suppresses all decoded
+text/callsigns. Only `text` or `decoded_text` is accepted from JSON; diagnostic
+`message`, `input`, paths and stderr are not evidence. JSON arrays, malformed
+JSON and non-string text are rejected. Plain-text stdout is trusted only after
+exit 0, so backends must send logs to stderr, never stdout. A backend score is
+preserved as an uncalibrated diagnostic, not a station-identification probability.
 
-For A/B testing, write normalized CW output next to the clip:
+Commands are tokenized before `{wav}` substitution, preserving spaces in paths.
+They run without a shell, with positive finite deadlines and bounded captured
+output. Timeout cleanup terminates their process group, including nested
+repository adapters. This is not a sandbox: use trusted one-shot commands that
+do not daemonize or start independent sessions.
 
-```bash
-.venv/bin/python3 scripts/morseangel_adapter.py \
-  --input runtime/done/some_repeater_clip.wav \
-  --command 'ACTUAL_DECODER_COMMAND --input {wav}' \
-  --output-json runtime/done/some_repeater_clip.cw.json \
-  --json \
-  --pretty
-```
+## Acceptance work
 
-## What to compare
+Use held-out real receiver recordings with manually checked references: clear
+IDs, late IDs, weak/noisy IDs, speech, silence, steady tones and mixed traffic.
+Compare exact text, missed callsigns and unexpected callsigns for each backend.
+Offline synthetic tests only establish limited controlled behavior and failure
+isolation; they do not certify a neural backend or RF recognition accuracy.
 
-For each known CW clip, compare:
-
-```text
-internal DSP decoder text
-external CW adapter text
-callsigns extracted
-label_candidates added
-stable label promoted over time
-```
-
-Good test clips:
-
-- Clear repeater CW ID.
-- Weak/noisy CW ID.
-- Speech-only repeater traffic.
-- Tone-only clip.
-- Mixed speech plus CW ID.
-- Empty/noise clip.
-
-## Important failure rules
-
-- A failed CW decoder should not stop Whisper transcription.
-- Empty CW output should not add label candidates.
-- CW text remains evidence, not final truth.
-- The classifier decides how to merge speech callsigns, CW callsigns, and tone evidence.
+Inspect `runtime/transcripts/evidence.html` for pending status, independent CW
+results and errors, while `raw.html` continues displaying original speech.

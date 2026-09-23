@@ -1,186 +1,120 @@
 #!/usr/bin/env python3
-"""Classify SDR audio clips for repeater IDs and tone evidence.
-
-This optional classifier estimates a dominant audio tone, runs the internal
-one-shot DSP CW decoder in repeater-id profile, can run an optional external
-command-line CW decoder, and returns JSON evidence used to populate label
-candidates.
-
-The output is evidence, not final truth. Repeated evidence over time is handled
-by transcribe_worker.py and runtime/classification_state.json.
-"""
+"""Run independent, deadline-bounded CW decoders. Output is evidence, not identity."""
 from __future__ import annotations
 
 import argparse
 import json
 import re
-import shlex
-import subprocess
 import sys
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+from safe_runtime import command_argv, decoded_output, positive_timeout, run_command
 
-from cw_decode import decode_wav  # noqa: E402
-
-CALLSIGN_RE = re.compile(r"\b(?:[AKNW][A-Z]?\d[A-Z]{1,3}|[A-Z]{1,2}\d[A-Z]{1,4})\b", re.IGNORECASE)
-
-
-def wav_info(path: Path) -> tuple[int, float]:
-    with wave.open(str(path), "rb") as wf:
-        sample_rate = wf.getframerate()
-        frames = wf.getnframes()
-    return sample_rate, frames / sample_rate if sample_rate else 0.0
+CALLSIGN_RE = re.compile(r'\b(?:[AKNW][A-Z]?\d[A-Z]{1,3}|[A-Z]{1,2}\d[A-Z]{1,4})\b', re.IGNORECASE)
 
 
 def extract_callsigns(text: str) -> list[str]:
-    return sorted(set(match.group(0).upper() for match in CALLSIGN_RE.finditer(text or "")))
+    return sorted({m.group(0).upper() for m in CALLSIGN_RE.finditer(text)})
 
 
-def run_external_cw_decoder(path: Path, command: str, timeout: int) -> dict[str, Any]:
+def run_external_cw_decoder(path: Path, command: str, timeout: float) -> dict[str, Any]:
     if not command:
-        return {"enabled": False}
-
-    if "{wav}" in command:
-        args = shlex.split(command.replace("{wav}", str(path)))
-    else:
-        args = shlex.split(command) + [str(path)]
-
+        return {'enabled': False, 'decoded': False, 'text': '', 'callsigns': [], 'label_candidates': []}
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = run_command(command_argv(command, path), timeout)
+        output = decoded_output(proc['stdout'], proc['error'])
+        output.update(enabled=True, engine='external-command', command=command,
+                      returncode=proc['returncode'], stderr=proc['stderr'][-4000:])
     except Exception as exc:
-        return {"enabled": True, "command": command, "error": str(exc), "label_candidates": []}
-
-    stdout = (proc.stdout or "").strip()
-    stderr = (proc.stderr or "").strip()
-    callsigns = extract_callsigns(stdout)
-    confidence = 0.72 if callsigns else 0.25 if stdout else 0.0
-    return {
-        "enabled": True,
-        "command": command,
-        "argv": args,
-        "returncode": proc.returncode,
-        "stdout": stdout[-4000:],
-        "stderr": stderr[-1000:],
-        "callsigns": callsigns,
-        "confidence": confidence,
-        "label_candidates": [
-            {
-                "type": "cw_callsign",
-                "label": callsign,
-                "value": callsign,
-                "confidence": confidence,
-                "source": "external_cw_decoder",
-            }
-            for callsign in callsigns
-        ],
-    }
+        output = {'enabled': True, 'decoded': False, 'text': '', 'confidence': None, 'error': str(exc)}
+    output['callsigns'] = extract_callsigns(output['text']) if output.get('decoded') else []
+    output['decoder_confidence'] = output.pop('confidence', None)
+    output['confidence'] = None  # Not calibrated, including a backend's own score.
+    output['verified'] = False
+    output['label_candidates'] = []
+    return output
 
 
-def classify_wav(
-    path: Path,
-    low_hz: int,
-    high_hz: int,
-    frame_ms: int,
-    external_command: str = "",
-    external_timeout: int = 20,
-    expected_wpm_min: float = 8.0,
-    expected_wpm_max: float = 30.0,
-) -> dict[str, Any]:
-    sample_rate, duration = wav_info(path)
-    cw = decode_wav(
-        path,
-        low_hz=low_hz,
-        high_hz=high_hz,
-        frame_ms=frame_ms,
-        expected_wpm_min=expected_wpm_min,
-        expected_wpm_max=expected_wpm_max,
-        profile="repeater-id",
-    )
-    external = run_external_cw_decoder(path, external_command, external_timeout)
+def run_internal_cw_decoder(path: Path, low_hz: int, high_hz: int, frame_ms: int,
+                            wpm_min: float, wpm_max: float, timeout: float) -> dict[str, Any]:
+    argv = [sys.executable, str(Path(__file__).with_name('cw_decode.py')), str(path),
+            '--profile', 'repeater-id', '--low-hz', str(low_hz), '--high-hz', str(high_hz),
+            '--frame-ms', str(frame_ms), '--expected-wpm-min', str(wpm_min), '--expected-wpm-max', str(wpm_max)]
+    proc = run_command(argv, timeout)
+    if proc['error']:
+        return {'decoded': False, 'text': '', 'callsigns': [], 'error': proc['error'], 'stderr': proc['stderr'][-4000:]}
+    value = json.loads(proc['stdout'])
+    if not isinstance(value, dict):
+        raise ValueError('internal CW decoder returned non-object JSON')
+    if not value.get('decoded'):
+        value['raw_decode_text'] = value.get('text', '')
+        value['text'], value['callsigns'] = '', []
+    value['heuristic_confidence'] = value.pop('confidence', None)
+    value['confidence'] = None
+    value['confidence_kind'] = 'uncalibrated heuristic; not a probability'
+    value['verified'] = False
+    value['label_candidates'] = []
+    return value
 
-    tone = cw.get("tone") or {"detected": False}
-    result: dict[str, Any] = {
-        "enabled": True,
-        "engine": "clip_classifier_v3",
-        "file": path.name,
-        "sample_rate": sample_rate,
-        "duration_sec": round(duration, 3),
-        "tone_id": {
-            "detected": bool(tone.get("detected")),
-            "frequency_hz": tone.get("frequency_hz"),
-            "power_ratio": tone.get("power_ratio"),
-            "confidence": tone.get("confidence", 0.0),
-            "duty_cycle": cw.get("duty_cycle"),
-            "keyed_candidate": cw.get("keyed_candidate", False),
-        },
-        "cw_id": {
-            "decoded": bool(cw.get("decoded")),
-            "engine": cw.get("engine"),
-            "profile": cw.get("profile"),
-            "text": cw.get("text", ""),
-            "confidence": cw.get("confidence", 0.0),
-            "callsigns": cw.get("callsigns", []),
-            "timing": cw.get("timing"),
-            "symbols": cw.get("symbols"),
-            "reason": cw.get("reason"),
-        },
-        "external_cw_decoder": external,
-        "label_candidates": [],
-    }
 
-    if tone.get("detected") and tone.get("frequency_hz"):
-        freq = int(tone["frequency_hz"])
-        result["label_candidates"].append({
-            "type": "tone_id_frequency",
-            "label": f"TONE_{freq}Hz",
-            "value": freq,
-            "confidence": tone.get("confidence", 0.0),
-            "source": "audio_tone_detection",
-        })
-
-    for candidate in cw.get("label_candidates", []):
-        result["label_candidates"].append(candidate)
-
-    for candidate in external.get("label_candidates", []):
-        result["label_candidates"].append(candidate)
-
+def classify_wav(path: Path, low_hz: int = 300, high_hz: int = 2000, frame_ms: int = 20,
+                 external_command: str = '', external_timeout: float = 20,
+                 expected_wpm_min: float = 8, expected_wpm_max: float = 30,
+                 internal_timeout: float = 20) -> dict[str, Any]:
+    positive_timeout(internal_timeout)
+    positive_timeout(external_timeout)
+    result: dict[str, Any] = {'enabled': True, 'engine': 'clip_classifier_v4', 'file': path.name,
+                              'label_candidates': [], 'automatic_label_promotion': False}
+    try:
+        with wave.open(str(path), 'rb') as stream:
+            result['sample_rate'] = stream.getframerate()
+            result['duration_sec'] = stream.getnframes() / stream.getframerate()
+    except Exception as exc:
+        result['audio_error'] = str(exc)
+    # Both commands start before either is awaited. Each has its own supervisor.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {
+            'cw_id': pool.submit(run_internal_cw_decoder, path, low_hz, high_hz, frame_ms,
+                                 expected_wpm_min, expected_wpm_max, internal_timeout),
+            'external_cw_decoder': pool.submit(run_external_cw_decoder, path, external_command, external_timeout),
+        }
+        for name, future in futures.items():
+            try:
+                value = future.result()
+                if not isinstance(value, dict):
+                    raise ValueError(f'{name} must return a JSON object')
+                result[name] = value
+            except Exception as exc:
+                result[name] = {'decoded': False, 'text': '', 'callsigns': [], 'error': str(exc)}
+    cw = result['cw_id']
+    tone = cw.get('tone') or {}
+    result['tone_id'] = {'detected': bool(tone.get('detected')), 'frequency_hz': tone.get('frequency_hz'),
+                         'heuristic_confidence': tone.get('confidence'), 'confidence': None,
+                         'keyed_candidate': cw.get('keyed_candidate', False)}
     return result
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Classify a WAV clip for CW ID and tone evidence")
-    parser.add_argument("wav", type=Path)
-    parser.add_argument("--low-hz", type=int, default=300)
-    parser.add_argument("--high-hz", type=int, default=2000)
-    parser.add_argument("--frame-ms", type=int, default=20)
-    parser.add_argument("--expected-wpm-min", type=float, default=8.0)
-    parser.add_argument("--expected-wpm-max", type=float, default=30.0)
-    parser.add_argument("--cw-external-command", default="", help="Optional external CW decoder command. Use {wav} placeholder or WAV path is appended.")
-    parser.add_argument("--cw-external-timeout", type=int, default=20)
-    parser.add_argument("--pretty", action="store_true")
-    return parser.parse_args()
-
-
 def main() -> int:
-    args = parse_args()
-    result = classify_wav(
-        args.wav,
-        args.low_hz,
-        args.high_hz,
-        args.frame_ms,
-        external_command=args.cw_external_command,
-        external_timeout=args.cw_external_timeout,
-        expected_wpm_min=args.expected_wpm_min,
-        expected_wpm_max=args.expected_wpm_max,
-    )
-    print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=True))
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('wav', type=Path)
+    p.add_argument('--low-hz', type=int, default=300)
+    p.add_argument('--high-hz', type=int, default=2000)
+    p.add_argument('--frame-ms', type=int, default=20)
+    p.add_argument('--expected-wpm-min', type=float, default=8)
+    p.add_argument('--expected-wpm-max', type=float, default=30)
+    p.add_argument('--cw-external-command', default='')
+    p.add_argument('--cw-external-timeout', type=float, default=20)
+    p.add_argument('--cw-internal-timeout', type=float, default=20)
+    p.add_argument('--pretty', action='store_true')
+    a = p.parse_args()
+    result = classify_wav(a.wav, a.low_hz, a.high_hz, a.frame_ms, a.cw_external_command,
+                          a.cw_external_timeout, a.expected_wpm_min, a.expected_wpm_max, a.cw_internal_timeout)
+    print(json.dumps(result, indent=2 if a.pretty else None, allow_nan=False))
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())
