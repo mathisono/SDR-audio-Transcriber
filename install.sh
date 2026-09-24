@@ -69,6 +69,8 @@ echo "Creating Python virtual environment..."
 source "${VENV_DIR}/bin/activate"
 python -m pip install --upgrade pip wheel setuptools
 python -m pip install "Cython==0.29.37"
+# Modern pip isolates build constraints; older Python/pip still uses PIP_CONSTRAINT.
+PIP_BUILD_CONSTRAINT="${ROOT_DIR}/constraints-python38.txt" \
 PIP_CONSTRAINT="${ROOT_DIR}/constraints-python38.txt" python -m pip install -r "${ROOT_DIR}/requirements.txt"
 
 chmod +x \

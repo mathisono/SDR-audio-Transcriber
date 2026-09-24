@@ -8,3 +8,6 @@ runtime/**/*.json
 runtime/**/*.jsonl
 runtime/transcripts/index.html
 !runtime/**/.gitkeep
+# Private corpus includes SQLite, WAL files, annotations and copied recordings.
+runtime/corpus/
+test-results/
