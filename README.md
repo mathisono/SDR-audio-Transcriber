@@ -149,4 +149,7 @@ local filesystem; `tmp` and `queue` must also share a filesystem. Do not run old
 and new workers against the same runtime or change runtime paths mid-recovery.
 
 See [reliability and migration notes](docs/speech-first-reliability.md) and the
-[parallel CW architecture](docs/parallel-cw-decoder-workflow.md).
+[parallel CW architecture](docs/parallel-cw-decoder-workflow.md). Offline candidate
+adapters, licenses and the small real-RF pilot are documented in the
+[local decoder comparison](docs/local-decoder-comparison.md); none is selected as
+the live production backend.

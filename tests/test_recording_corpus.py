@@ -239,6 +239,17 @@ class CorpusTests(unittest.TestCase):
         m = c.score(reference(speech='go to 147.66', required_tokens=['147.66']), 'go to 147.76', 'speech')
         self.assertFalse(m['required_tokens']['147.66'])
 
+    def test_callsign_only_speech_reference_and_parser_score(self):
+        ref = c.validate_reference(reference(
+            speech=None, cw=None, speech_callsigns=['KO6IGQ']))
+        candidates = [{'candidate': 'KO6IGQ', 'complete': True},
+                      {'candidate': 'KJ6D', 'complete': False}]
+        measured = c.score(ref, 'raw phonetic transcript', 'parakeet', candidates)
+        self.assertFalse(measured['text_scored'])
+        self.assertEqual(measured['callsigns']['correct'], ['KO6IGQ'])
+        self.assertEqual(c.summarize([{'status': 'completed', 'metrics': measured}])[
+            'callsign_recall'], 1)
+
     def test_unreviewed_measured_is_unscored(self):
         self.collect(split='test')
         out = self.run_fake()
@@ -320,6 +331,28 @@ class CorpusTests(unittest.TestCase):
         self.assertEqual(c.compare(self.root, a, b)['paired'], 0)
         self.assertEqual(c.report(self.root, a)['summary']['exact_positive_clips'], 1)
 
+    def test_parser_rescore_keeps_frozen_review_and_never_prompts_parser(self):
+        ref = reference(speech=None, cw=None, speech_callsigns=['KO6IGQ'])
+        asset = self.labeled(ref)
+        config = {'engine': 'parakeet', 'timeout': 1}
+        parent = c.evaluate(
+            self.root, ROOT, config,
+            runner=lambda *a: {'status': 'completed',
+                               'text': 'kilo oscar six india golf quebec'})['run']
+        c.annotate(self.root, asset, 'later-review', reference(
+            speech=None, cw=None, speech_callsigns=['KJ6DZB']))
+        seen = []
+        def parse_without_reference(text, words):
+            seen.append((text, words))
+            return [{'candidate': 'KO6IGQ', 'complete': True}]
+        with mock.patch('callsign_parser.parse_callsigns', side_effect=parse_without_reference):
+            rescored = c.rescore_callsigns(self.root, ROOT, parent)
+        self.assertEqual(seen, [('kilo oscar six india golf quebec', None)])
+        self.assertEqual(rescored['summary']['callsigns_correct'], 1)
+        child = c.report(self.root, rescored['run'])
+        self.assertEqual(child['results'][0]['review'], c.report(self.root, parent)['results'][0]['review'])
+        self.assertEqual(child['provenance']['configuration']['parent_run'], parent)
+
     def test_split_and_origin_selection(self):
         self.collect(split='test', origin='synthetic')
         with self.assertRaises(ValueError):
@@ -395,7 +428,7 @@ class DecoderProtocolTests(unittest.TestCase):
 
     def test_explicit_json_success(self):
         result = self.execute("import json\nprint(json.dumps({'decoded':True,'text':'DE KJ6DZB'}))\n")
-        self.assertEqual(result['status'], 'measured')
+        self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['text'], 'DE KJ6DZB')
 
     def test_spaced_path_one_argument(self):

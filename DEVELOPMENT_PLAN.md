@@ -27,15 +27,19 @@ corpus work is based on its head `87c87e7a141580d3e067ba1b9da947d86c35f3bb`, not
 older `main` implementation. Merge/rebase dependencies deliberately; do not run
 old and new consumers against the same live runtime directories.
 
-This increment adds `scripts/recording_corpus.py`, `scripts/corpus_decode.py` and
-regression tests. It copies finalized recordings into a private local corpus,
-records acquisition settings and PCM diagnostics, stores append-only reviewed
-references, runs actual decoder commands when available, and compares predictions
-against fixed references. See [the collection/testing runbook](docs/recording-corpus.md).
+The corpus increment adds `scripts/recording_corpus.py`, stable backend identities,
+versioned callsign-parser rescoring and supervised local decoder adapters. It copies
+finalized recordings into a private local corpus, records acquisition settings and
+PCM diagnostics, stores append-only reviewed references, runs actual decoder
+commands when available, and compares predictions against fixed references. See
+the [collection/testing runbook](docs/recording-corpus.md) and the
+[local-decoder comparison](docs/local-decoder-comparison.md).
 
-It does **not** start a receiver, change live settings, train a model, install a
-neural CW backend, demonstrate live-RF accuracy, export SigMF, or delete data.
-The retention command is audit-only and always keeps recordings and metadata.
+It does **not** start a receiver, change live settings, train a model, demonstrate
+production-grade RF accuracy, export SigMF, or delete data. The retention command
+is audit-only and always keeps recordings and metadata. Isolated DeepCW,
+multimon-ng, Parakeet and Qwen runtimes used for the pilot remain private and are
+not installed by this repository.
 
 ## Architectural invariants
 
@@ -96,6 +100,21 @@ The first collection campaign should span multiple sessions, receivers/settings
 where available, signal qualities and speakers; a convenient small sample is not
 an acceptance dataset. Choose numerical acceptance thresholds after the pilot,
 before evaluating the final held-out set.
+
+### M1.5 — Local decoder candidate pilot (experimental)
+
+The 2026-09-28 fixed-audio pilot ran real DeepCW, multimon-ng, internal DSP,
+Parakeet TDT 0.6B v3 and Qwen3-ASR 0.6B inference without changing capture or
+production. DeepCW recovered 3/3 reviewed IDs in full one-minute sources;
+multimon-ng recovered 2/3; internal DSP recovered 1/3 and emitted three extra
+callsign-shaped tokens. Parakeet recovered 1/4 source-linked reviewed spoken
+callsigns after rule-based interpretation; the Whisper control recovered 0/4.
+Qwen completed too little coverage and was slower than real time on the CPU host.
+
+These candidate-enriched counts do not pass M1 or M5. DeepCW and Parakeet earn a
+larger session-balanced trial; automatic station promotion and decoder replacement
+remain disabled. Freeze more independent reviews and real negative controls before
+choosing thresholds or opening the held-out session.
 
 ### M2 — Single-chain I/Q replay and acquisition experiments
 
@@ -219,6 +238,7 @@ post hoc or filter out failures to manufacture progress.
 ## References
 
 - [Collection and decoder testing runbook](docs/recording-corpus.md)
+- [Local speech and CW decoder comparison](docs/local-decoder-comparison.md)
 - [Speech-first reliability](docs/speech-first-reliability.md)
 - [SigMF specification](https://sigmf.org/): capture/annotation and extension rules.
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper): actual inference API.

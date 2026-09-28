@@ -32,7 +32,7 @@ def main():
             loaded = time.monotonic()
             text, segments, info = transcribe_file(model, a.wav.resolve())
             finished = time.monotonic()
-        result.update(status='measured', real_inference_run=True, text=text,
+        result.update(status='completed' if text else 'no_decode', real_inference_run=True, text=text,
                       segments=segments, model=a.model, device=a.device,
                       compute_type=a.compute_type, model_load_seconds=loaded-started,
                       inference_seconds=finished-loaded)
