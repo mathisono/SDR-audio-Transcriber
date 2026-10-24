@@ -172,6 +172,22 @@ First run several known channels concurrently using one I/Q stream and a bounded
 shared pool of loaded transcription models. Do not load a full Whisper model per
 frequency. Benchmark aggregate channel traffic on the target hardware.
 
+Put speech backends behind a normalized provider contract so the same queue can
+use a downloaded local model, a persistent LAN service, or an explicitly
+configured remote audio-transcription provider. Preserve provider/model identity,
+source checksum, raw output, timestamps, queue/network/inference timing, failures,
+fallback history, and remote-retention policy on every result. LM Studio is a
+valid route only when the selected model and endpoint are verified to accept
+audio; text cleanup is not ASR.
+
+Add a hardware optimizer that benchmarks cold/warm RTF, p50/p95 latency, queue
+recovery, memory/VRAM, thermals, network reliability, and remote cost. It may tune
+speed and resource settings automatically within explicit constraints, but it
+must use independently reviewed references for accuracy floors. Cache profiles by
+hardware, engine/model revision, preprocessing, quantization, threads, and chunk
+policy. Keep a local-only privacy mode and report a blocker when no profile meets
+all required constraints.
+
 Then add detection, modulation checking, channel tracking and a receiver lifecycle:
 detected -> checking -> receiving -> holding -> idle. Detection proposes a signal;
 it does not establish FM speech. Keep unknown/unsupported outcomes and hysteresis

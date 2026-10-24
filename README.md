@@ -31,7 +31,17 @@ callsign accuracy remain unmeasured.
 
 - [Speech model selection](docs/speech-model-selection.md)
 - [Machine-readable reconciliation](docs/speech-model-reconciliation-20261024.json)
+- [Real-time, local/remote provider, and hardware-optimizer notes](docs/provider-routing-and-optimization.md)
 - [Local decoder comparison and reproducible commands](docs/local-decoder-comparison.md)
+
+On the tested CPU host, Parakeet's measured 0.588 RTF and Whisper's 0.202
+RTF both support a single continuous channel in throughput terms. Offloading is
+optional for that case. A future normalized provider layer will support downloaded
+local models, persistent LAN services, and explicitly configured remote audio
+providers. LM Studio is eligible only when its active model/server actually
+supports audio transcription; a text cleanup model is not an ASR backend. The
+planned optimizer will compare warm/cold throughput, latency, memory, thermals,
+network, reliability, cost, and independently reviewed accuracy floors.
 
 ## Install
 
