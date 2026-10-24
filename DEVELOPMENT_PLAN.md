@@ -116,6 +116,18 @@ larger session-balanced trial; automatic station promotion and decoder replaceme
 remain disabled. Freeze more independent reviews and real negative controls before
 choosing thresholds or opening the held-out session.
 
+The 2026-10-24 same-clip follow-up ran Parakeet and faster-whisper `small.en` on
+all 35 frozen blind-review clips (936.2 seconds) with no decoder errors. Both
+matched the independent audio-model branch's speech-presence decisions on all 33
+usable automated reviews. Parakeet had lower transcript disagreement with that
+branch (0.510 versus 0.637 word edits per automated-review word), but took 551
+seconds versus 189 seconds on the bounded CPU run. Automated agreement is not
+human truth and WER remains null. Combined with the earlier human-reviewed
+callsign pilot (Parakeet 1/4, Whisper 0/4), Parakeet is selected as the **primary
+experimental speech implementation** and Whisper remains the fast baseline and
+fallback. This decision advances implementation only; M1 review coverage and
+production-accuracy gates remain open.
+
 ### M2 — Single-chain I/Q replay and acquisition experiments
 
 Add optional SigMF-compatible I/Q retention and replay, starting with one known FM

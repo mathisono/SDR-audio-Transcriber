@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from pipeline_store import record_path, refresh_views
-from safe_runtime import archive_file, atomic_json, exclusive_lock, fsync_directory, positive_timeout, read_json, run_command, sha256
+from safe_runtime import (archive_file, atomic_json, command_argv, exclusive_lock,
+                          fsync_directory, positive_timeout, read_json, run_command,
+                          sha256)
 
 # Import lazily so capture, CW and offline regression tests need no ASR runtime.
 WhisperModel = None
@@ -78,6 +80,36 @@ def transcribe_file(model: Any, wav_path: Path) -> tuple[str, list[dict[str, Any
     return ' '.join(parts).strip(), details, info
 
 
+def transcribe_parakeet(command: str, wav_path: Path, timeout: float) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """Run the selected local Parakeet adapter as a bounded one-shot command."""
+    if not command.strip():
+        raise ValueError('Parakeet backend requires --parakeet-command')
+    output = run_command(command_argv(command, wav_path), positive_timeout(timeout))
+    try:
+        value = json.loads(output['stdout'])
+        if not isinstance(value, dict):
+            raise ValueError('Parakeet adapter output must be a JSON object')
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        detail = output['error'] or str(exc)
+        raise ValueError(f'invalid Parakeet adapter output: {detail}') from exc
+    if output['error']:
+        raise RuntimeError(output['error'])
+    if value.get('status') not in {'completed', 'no_decode'}:
+        raise ValueError('Parakeet adapter status must be completed or no_decode')
+    text = value.get('text')
+    if not isinstance(text, str):
+        raise ValueError('Parakeet adapter text must be a string')
+    segments = value.get('words', value.get('segments', []))
+    if not isinstance(segments, list) or any(not isinstance(item, dict) for item in segments):
+        raise ValueError('Parakeet adapter words/segments must be a list of objects')
+    if value['status'] == 'no_decode' and text.strip():
+        raise ValueError('Parakeet no_decode result must have empty text')
+    if value['status'] == 'completed' and not text.strip():
+        raise ValueError('Parakeet completed result must have non-empty text')
+    value['stderr'] = output['stderr']
+    return text.strip(), segments, value
+
+
 def runtime_versions() -> dict[str, str]:
     result = {'python': sys.version.split()[0]}
     for name in ('faster-whisper', 'ctranslate2', 'av', 'onnxruntime', 'numpy'):
@@ -133,9 +165,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('queue', 'processing', 'done', 'failed', 'transcripts'):
         p.add_argument('--' + name, default='runtime/' + name)
+    p.add_argument('--speech-backend', choices=('whisper', 'parakeet'), default='whisper')
     p.add_argument('--classification-state', default='runtime/classification_state.json',
                    help='Legacy option accepted; automatic station-label promotion is disabled.')
     p.add_argument('--whisper-model', default='small.en')
+    p.add_argument('--parakeet-command', default='',
+                   help='Trusted one-shot adapter command; {wav} is substituted after tokenization.')
+    p.add_argument('--speech-timeout', type=float, default=180)
     p.add_argument('--model-revision', default=None, help='Optional operator-supplied model artifact revision for provenance')
     p.add_argument('--device', default='cpu')
     p.add_argument('--compute-type', default='int8')
@@ -238,15 +274,34 @@ def process_clip(wav: Path, model: Any, args: argparse.Namespace) -> None:
             record['audio_format'] = {'sample_rate': wf.getframerate(), 'channels': wf.getnchannels(),
                                       'sample_width': wf.getsampwidth()}
         record['audio_sha256'] = sha256(proc)
-        raw, segments, info = transcribe_file(model, proc)
+        if args.speech_backend == 'parakeet':
+            raw, segments, info = transcribe_parakeet(
+                args.parakeet_command, proc, args.speech_timeout)
+            asr = {
+                'backend': 'parakeet', 'engine': info.get('engine'),
+                'model': info.get('model'), 'model_revision': info.get('model_revision'),
+                'model_sha256': info.get('model_sha256'), 'device': info.get('device', args.device),
+                'compute_type': 'q8_0', 'preprocessing': info.get('preprocessing'),
+                'command': args.parakeet_command, 'timeout_seconds': args.speech_timeout,
+                'reported_confidence': info.get('reported_confidence'),
+                'confidence_note': info.get('confidence_note'),
+                'elapsed_seconds': round(time.monotonic() - start, 3)
+            }
+            language = language_probability = None
+        else:
+            raw, segments, info = transcribe_file(model, proc)
+            asr = {
+                'backend': 'whisper', 'model': args.whisper_model,
+                'model_revision': args.model_revision, 'device': args.device,
+                'compute_type': args.compute_type, 'options': ASR_OPTIONS,
+                'versions': runtime_versions(),
+                'elapsed_seconds': round(time.monotonic() - start, 3)
+            }
+            language = getattr(info, 'language', None)
+            language_probability = getattr(info, 'language_probability', None)
         record.update(raw_text=raw, text=raw, segments=segments, speech_status='complete',
-                      language=getattr(info, 'language', None),
-                      language_probability=getattr(info, 'language_probability', None),
-                      asr={'model': args.whisper_model, 'model_revision': args.model_revision,
-                           'device': args.device, 'compute_type': args.compute_type,
-                           'options': ASR_OPTIONS, 'versions': runtime_versions(),
-                           'elapsed_seconds': round(time.monotonic() - start, 3)},
-                      enrichment=enrichment_request(args, metadata.get('mode')))
+                      language=language, language_probability=language_probability,
+                      asr=asr, enrichment=enrichment_request(args, metadata.get('mode')))
         destination = Path(args.done)
     except Exception as exc:
         record.update(error=str(exc), speech_status='failed', enrichment={'status': 'disabled'})
@@ -261,8 +316,11 @@ def process_clip(wav: Path, model: Any, args: argparse.Namespace) -> None:
 
 def main() -> int:
     args = parse_args()
-    for timeout in (args.cw_internal_timeout, args.cw_external_timeout, args.cleanup_timeout, args.poll_seconds):
+    for timeout in (args.speech_timeout, args.cw_internal_timeout, args.cw_external_timeout,
+                    args.cleanup_timeout, args.poll_seconds):
         positive_timeout(timeout)
+    if args.speech_backend == 'parakeet' and not args.parakeet_command.strip():
+        raise ValueError('Parakeet backend requires --parakeet-command')
     for name in ('queue', 'processing', 'done', 'failed', 'transcripts'):
         setattr(args, name, str(Path(getattr(args, name)).resolve()))
         Path(getattr(args, name)).mkdir(parents=True, exist_ok=True)
@@ -278,11 +336,15 @@ def main() -> int:
         # Durable checkpoints do not require loading the model to recover.
         for checkpoint in sorted(Path(args.processing).glob('*.transcript.json')):
             finish_checkpoint(checkpoint, args)
-        model_class = WhisperModel
-        if model_class is None:
-            from faster_whisper import WhisperModel as model_class
-        print(f'worker: loading {args.whisper_model} ({args.device}/{args.compute_type})', flush=True)
-        model = model_class(args.whisper_model, device=args.device, compute_type=args.compute_type)
+        if args.speech_backend == 'parakeet':
+            print(f'worker: using bounded Parakeet adapter ({args.device})', flush=True)
+            model = None
+        else:
+            model_class = WhisperModel
+            if model_class is None:
+                from faster_whisper import WhisperModel as model_class
+            print(f'worker: loading {args.whisper_model} ({args.device}/{args.compute_type})', flush=True)
+            model = model_class(args.whisper_model, device=args.device, compute_type=args.compute_type)
         if args.enable_classifier or (args.enable_cleanup and not args.no_cleanup):
             print('worker: optional jobs queued; run scripts/enrichment_worker.py with matching --done and --transcripts', flush=True)
         stopped = []

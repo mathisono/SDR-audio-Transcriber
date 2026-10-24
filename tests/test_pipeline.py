@@ -238,6 +238,58 @@ class SpeechCase(BaseCase):
         self.assertEqual(len(segments), 2)
         self.assertEqual(segments[0]['avg_logprob'], -0.2)
 
+    def parakeet_command(self, *, status='completed', text='Test speech was preserved.',
+                         words=None, exit_code=0):
+        words = words if words is not None else [
+            {'word': 'Test', 'start': 0.0, 'end': 0.2, 'confidence': 0.9},
+            {'word': 'speech', 'start': 0.2, 'end': 0.5, 'confidence': 0.8},
+        ]
+        value = {'status': status, 'text': text, 'words': words,
+                 'engine': 'nemo-speech-parakeet-tdt-0.6b-v3-q8_0',
+                 'model': '/private/parakeet.q8_0.gguf', 'model_revision': 'fixture-rev',
+                 'model_sha256': 'a' * 64, 'device': 'cpu',
+                 'preprocessing': {'target_sample_rate_hz': 16000},
+                 'reported_confidence': 0.8,
+                 'confidence_note': 'backend diagnostic; not comparable across models'}
+        code = f'import json,sys;print(json.dumps({value!r}));raise SystemExit({exit_code})'
+        return shlex.join([sys.executable, '-c', code]) + ' {wav}'
+
+    def test_parakeet_backend_publishes_raw_text_and_provenance(self):
+        args = self.args('--speech-backend', 'parakeet', '--parakeet-command', self.parakeet_command())
+        worker.process_clip(self.queued(), None, args)
+        record = self.record()
+        self.assertEqual(record['speech_status'], 'complete')
+        self.assertEqual(record['raw_text'], 'Test speech was preserved.')
+        self.assertEqual(record['segments'][0]['word'], 'Test')
+        self.assertEqual(record['asr']['backend'], 'parakeet')
+        self.assertEqual(record['asr']['model_revision'], 'fixture-rev')
+        self.assertEqual(record['asr']['model_sha256'], 'a' * 64)
+        self.assertIsNone(record['language'])
+
+    def test_parakeet_no_decode_is_a_durable_empty_success(self):
+        command = self.parakeet_command(status='no_decode', text='', words=[])
+        args = self.args('--speech-backend', 'parakeet', '--parakeet-command', command)
+        worker.process_clip(self.queued(), None, args)
+        record = self.record()
+        self.assertEqual(record['speech_status'], 'complete')
+        self.assertEqual(record['raw_text'], '')
+        self.assertTrue((self.root / 'done/test.wav').exists())
+
+    def test_parakeet_failure_preserves_audio_in_failed_archive(self):
+        args = self.args('--speech-backend', 'parakeet', '--parakeet-command',
+                         self.parakeet_command(exit_code=2))
+        worker.process_clip(self.queued(), None, args)
+        record = self.record()
+        self.assertEqual(record['speech_status'], 'failed')
+        self.assertTrue((self.root / 'failed/test.wav').exists())
+        self.assertIn('decoder exited 2', record['error'])
+
+    def test_parakeet_rejects_inconsistent_status_and_text(self):
+        command = self.parakeet_command(status='no_decode', text='not empty', words=[])
+        args = self.args('--speech-backend', 'parakeet', '--parakeet-command', command)
+        worker.process_clip(self.queued(), None, args)
+        self.assertEqual(self.record()['speech_status'], 'failed')
+
     def test_speech_published_before_any_optional_work(self):
         args = self.args('--enable-classifier', '--enable-cleanup')
         with patch.object(worker, 'run_clip_classifier', side_effect=AssertionError('must not run inline')):

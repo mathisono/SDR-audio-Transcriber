@@ -195,3 +195,34 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile scripts/*.py tests/*.py
 git diff --check
 ```
+
+## 2026-10-24 speech implementation selection
+
+A direct same-input follow-up imported the frozen 35-clip blind-review package
+(936.2 seconds) into a new private checksum-addressed corpus. Parakeet and Whisper
+each completed 35/35 clips with identical 23 text / 12 no-decode status counts and
+no errors.
+
+| Backend | Wall / outer RTF | Peak RSS | Blind audio-model transcript disagreement* |
+| --- | ---: | ---: | ---: |
+| Parakeet TDT 0.6B v3 Q8 | 550.99 s / 0.588 | 1,167,224 KiB | 0.510 |
+| faster-whisper `small.en` | 189.36 s / 0.202 | 920,244 KiB | 0.637 |
+
+\*Micro word edits divided by the automated review transcript's word count across
+22 clips where both branches returned text. This is model-to-model agreement, not
+human WER or accuracy.
+
+Both local backends matched the blind audio model's speech-presence decision on
+all 33 schema-conforming/usable reviews (22 speech, 11 no speech). Parakeet had one
+exact callsign-string agreement (`KJ6DZB`); Whisper's one exact string agreement
+was `BLAST`, a spelled word rather than a valid amateur callsign. Neither agreement
+is human ground truth. Parakeet also produced callsign-shaped candidates on eight
+clips where the audio model returned no spoken callsign, so parser false-positive
+behavior remains an explicit review target.
+
+**Selection:** use Parakeet as the primary experimental speech backend for the
+transcriber because it has the only human-reviewed exact callsign recovery in the
+pilot (1/4 versus Whisper 0/4) and the lower automated transcript-disagreement
+rate. Keep faster-whisper `small.en` as the faster baseline/fallback. Do not claim
+population WER or production accuracy until session-balanced human transcripts,
+spoken callsigns, and negative controls are reviewed.

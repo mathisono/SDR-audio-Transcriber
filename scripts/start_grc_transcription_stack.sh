@@ -19,6 +19,9 @@ THRESHOLD=""
 HANG_MS="1800"
 FIFO=""
 WHISPER_MODEL="small.en"
+SPEECH_BACKEND="whisper"
+PARAKEET_COMMAND=""
+SPEECH_TIMEOUT="180"
 DEVICE="cpu"
 COMPUTE_TYPE="int8"
 CLASSIFY_MODES="nfm"
@@ -88,7 +91,10 @@ Options:
   --hang-ms MS                  clip_writer hang time. Default: 1800
   --fifo PATH                   FIFO path. Default: runtime/grc_audio.pcm absolute path
 
+  --speech-backend NAME         whisper or parakeet. Default: whisper
   --whisper-model NAME          faster-whisper model. Default: small.en
+  --parakeet-command CMD        Required trusted adapter command for parakeet
+  --speech-timeout SEC          Per-clip speech timeout. Default: 180
   --device cpu|cuda             faster-whisper device. Default: cpu
   --compute-type TYPE           faster-whisper compute type. Default: int8
   --classify-modes MODES        Worker classify modes. Default: nfm
@@ -200,7 +206,10 @@ while [[ $# -gt 0 ]]; do
     --threshold) THRESHOLD="$2"; shift 2 ;;
     --hang-ms) HANG_MS="$2"; shift 2 ;;
     --fifo) FIFO="$2"; shift 2 ;;
+    --speech-backend) SPEECH_BACKEND="$2"; shift 2 ;;
     --whisper-model) WHISPER_MODEL="$2"; shift 2 ;;
+    --parakeet-command) PARAKEET_COMMAND="$2"; shift 2 ;;
+    --speech-timeout) SPEECH_TIMEOUT="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --compute-type) COMPUTE_TYPE="$2"; shift 2 ;;
     --classify-modes) CLASSIFY_MODES="$2"; shift 2 ;;
@@ -275,12 +284,17 @@ CLIP_CMD=(scripts/start_grc_clip_writer.sh
 if [[ -n "${VERBOSE}" ]]; then CLIP_CMD+=("${VERBOSE}"); fi
 
 WORKER_CMD=("${PY}" scripts/transcribe_worker.py
+  --speech-backend "${SPEECH_BACKEND}"
+  --speech-timeout "${SPEECH_TIMEOUT}"
   --whisper-model "${WHISPER_MODEL}"
   --device "${DEVICE}"
   --compute-type "${COMPUTE_TYPE}"
   --enable-classifier
   --classify-modes "${CLASSIFY_MODES}"
 )
+if [[ -n "${PARAKEET_COMMAND}" ]]; then
+  WORKER_CMD+=(--parakeet-command "${PARAKEET_COMMAND}")
+fi
 if [[ "${NO_CLEANUP}" == "1" ]]; then
   WORKER_CMD+=(--no-cleanup)
 else
@@ -299,6 +313,7 @@ launcher: GRC visual receiver stack
   frequency:   ${FREQUENCY}
   source:      ${SOURCE}
   receiver:    ${RECEIVER}
+  speech:      ${SPEECH_BACKEND}
   fifo:        ${FIFO}
   grc file:    ${GRC_FILE}
   web:         http://$(hostname -s 2>/dev/null || echo localhost):${WEB_PORT}/
