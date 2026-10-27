@@ -28,7 +28,15 @@ import wave
 
 SPLITS = ('quarantine', 'train', 'validation', 'test')
 ORIGINS = ('rf', 'synthetic', 'unknown')
-ENGINES = ('speech', 'cw', 'external-cw')
+ENGINE_MODALITY = {
+    # Historical aliases remain readable; new runs use stable backend IDs.
+    'speech': 'speech', 'whisper': 'speech',
+    'parakeet': 'speech', 'qwen3-asr': 'speech', 'external-speech': 'speech',
+    'cw': 'cw', 'cw-internal': 'cw', 'external-cw': 'cw',
+    'deepcw': 'cw', 'multimon-cw': 'cw', 'morseangel': 'cw',
+}
+ENGINES = tuple(ENGINE_MODALITY)
+SUCCESS_STATUSES = ('completed', 'no_decode', 'measured')  # measured is legacy.
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS sessions (
  id TEXT PRIMARY KEY, split TEXT NOT NULL, origin TEXT NOT NULL, settings TEXT NOT NULL);
@@ -220,11 +228,12 @@ def validate_reference(value):
     for name in ('speech', 'cw'):
         if name not in value or (value[name] is not None and not isinstance(value[name], str)):
             raise ValueError(name + ' must be text, empty text (absent), or null (unknown)')
-    if value['speech'] is None and value['cw'] is None:
-        raise ValueError('review at least one decoder target')
+    if (value['speech'] is None and value['cw'] is None and
+            value.get('speech_callsigns') is None and value.get('cw_callsigns') is None):
+        raise ValueError('review at least one decoder target or callsign target')
     if not isinstance(value.get('protected', False), bool):
         raise ValueError('protected must be boolean')
-    for key in ('callsigns', 'required_tokens'):
+    for key in ('callsigns', 'speech_callsigns', 'cw_callsigns', 'required_tokens'):
         entries = value.get(key)  # null means not reviewed, [] means none present.
         if entries is not None and (not isinstance(entries, list) or any(
                 not isinstance(x, str) or not x.strip() for x in entries)):
@@ -266,30 +275,47 @@ def distance(a, b):
     return row[-1]
 
 
-def score(reference, text, engine):
+def score(reference, text, engine, callsign_candidates=None):
     """A missing reference is unscored; empty reference is a negative control."""
-    key = 'speech' if engine == 'speech' else 'cw'
+    key = ENGINE_MODALITY[engine]
     ref = reference.get(key)
-    if ref is None:
+    callsign_key = key + '_callsigns'
+    expected_values = reference.get(callsign_key)
+    if expected_values is None and key == 'cw':
+        expected_values = reference.get('callsigns')  # schema-v1 compatibility
+    if ref is None and expected_values is None:
         return None
-    if key == 'cw':
-        a, b = (re.findall(r'[A-Z0-9/?]+', x.upper()) for x in (ref, text))
+    if ref is None:
+        measured = {'normalization': None, 'text_scored': False,
+                    'word_errors': 0, 'reference_words': 0,
+                    'character_errors': 0, 'reference_characters': 0,
+                    'exact': None, 'negative_control': False, 'false_text': False,
+                    'wer': None, 'cer': None}
     else:
-        a, b = tokens(ref), tokens(text)
-    char_a, char_b = ''.join(a), ''.join(b)
-    measured = {'normalization': 'cw-alnum-slash-unknown-v1' if key == 'cw' else 'ascii-alnum-v1', 'word_errors': distance(a, b),
-                'reference_words': len(a), 'character_errors': distance(char_a, char_b),
-                'reference_characters': len(char_a), 'exact': a == b and (bool(a) or not text.strip()),
-                'negative_control': not a, 'false_text': bool(not a and text.strip())}
-    measured['wer'] = measured['word_errors'] / len(a) if a else None
-    measured['cer'] = measured['character_errors'] / len(char_a) if char_a else None
-    if key == 'speech' and reference.get('required_tokens') is not None:
+        if key == 'cw':
+            a, b = (re.findall(r'[A-Z0-9/?]+', x.upper()) for x in (ref, text))
+        else:
+            a, b = tokens(ref), tokens(text)
+        char_a, char_b = ''.join(a), ''.join(b)
+        measured = {'normalization': 'cw-alnum-slash-unknown-v1' if key == 'cw' else 'ascii-alnum-v1',
+                    'text_scored': True, 'word_errors': distance(a, b),
+                    'reference_words': len(a), 'character_errors': distance(char_a, char_b),
+                    'reference_characters': len(char_a),
+                    'exact': a == b and (bool(a) or not text.strip()),
+                    'negative_control': not a, 'false_text': bool(not a and text.strip())}
+        measured['wer'] = measured['word_errors'] / len(a) if a else None
+        measured['cer'] = measured['character_errors'] / len(char_a) if char_a else None
+    if key == 'speech' and ref is not None and reference.get('required_tokens') is not None:
         padded = ' ' + ' '.join(b) + ' '
         measured['required_tokens'] = {x: (' ' + ' '.join(tokens(x)) + ' ') in padded
                                        for x in reference['required_tokens']}
-    if key == 'cw' and reference.get('callsigns') is not None:
-        predicted = set(re.findall(r'\b[A-Z]{1,2}\d[A-Z]{1,4}(?:/[A-Z0-9]+)?\b', text.upper()))
-        expected = {c.upper() for c in reference['callsigns']}
+    if expected_values is not None:
+        if key == 'speech':
+            predicted = {item['candidate'].upper() for item in (callsign_candidates or [])
+                         if item.get('complete') and isinstance(item.get('candidate'), str)}
+        else:
+            predicted = set(re.findall(r'\b[A-Z]{1,2}\d[A-Z]{1,4}(?:/[A-Z0-9]+)?\b', text.upper()))
+        expected = {c.upper() for c in expected_values}
         measured['callsigns'] = {'correct': sorted(expected & predicted),
                                 'missed': sorted(expected - predicted),
                                 'extra': sorted(predicted - expected)}
@@ -299,32 +325,39 @@ def score(reference, text, engine):
 def summarize(results):
     counts = Counter(r['status'] for r in results)
     scored = [r['metrics'] for r in results if r.get('metrics') is not None]
-    positive = [m for m in scored if not m['negative_control']]
-    negatives = [m for m in scored if m['negative_control']]
+    positive = [m for m in scored if m.get('text_scored', True) and not m['negative_control']]
+    negatives = [m for m in scored if m.get('text_scored', True) and m['negative_control']]
     words = sum(m['reference_words'] for m in positive)
     chars = sum(m['reference_characters'] for m in positive)
+    correct = sum(len(m.get('callsigns', {}).get('correct', [])) for m in scored)
+    missed = sum(len(m.get('callsigns', {}).get('missed', [])) for m in scored)
+    extra = sum(len(m.get('callsigns', {}).get('extra', [])) for m in scored)
     return {'attempted': len(results), 'statuses': dict(counts), 'scored': len(scored),
             'positive_clips': len(positive), 'negative_clips': len(negatives),
             'exact_positive_clips': sum(m['exact'] for m in positive),
             'word_error_rate': sum(m['word_errors'] for m in positive) / words if words else None,
             'character_error_rate': sum(m['character_errors'] for m in positive) / chars if chars else None,
             'negative_false_text_clips': sum(m['false_text'] for m in negatives),
-            'callsigns_correct': sum(len(m.get('callsigns', {}).get('correct', [])) for m in scored),
-            'callsigns_missed': sum(len(m.get('callsigns', {}).get('missed', [])) for m in scored),
-            'callsigns_extra': sum(len(m.get('callsigns', {}).get('extra', [])) for m in scored),
+            'callsigns_correct': correct, 'callsigns_missed': missed, 'callsigns_extra': extra,
+            'callsign_precision': correct / (correct + extra) if correct + extra else None,
+            'callsign_recall': correct / (correct + missed) if correct + missed else None,
+            'callsign_metric_definition': 'micro counts over reviewed identities; precision=correct/(correct+extra), recall=correct/(correct+missed)',
             'accuracy_claim': 'measured subset only; blocked/error/unreviewed clips are not passes'}
 
 
 def provenance(repo, config):
     import importlib.metadata
     packages = {}
-    for name in ('faster-whisper', 'ctranslate2', 'av', 'onnxruntime'):
+    for name in ('faster-whisper', 'ctranslate2', 'av', 'onnxruntime', 'numpy',
+                 'torch', 'transformers', 'qwen-asr'):
         try:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
     paths = ('recording_corpus.py', 'corpus_decode.py', 'transcribe_worker.py',
-             'cw_decode.py', 'safe_runtime.py')
+             'cw_decode.py', 'safe_runtime.py', 'callsign_parser.py',
+             'deepcw_adapter.py', 'multimon_cw_adapter.py',
+             'nemo_speech_adapter.py', 'qwen_asr_adapter.py')
     return {'configuration': config, 'python': sys.version, 'packages': packages,
             'evaluator_sha256': {p: file_hash(Path(__file__).parent / p)
                                  for p in ('recording_corpus.py', 'safe_runtime.py')
@@ -337,22 +370,23 @@ def provenance(repo, config):
 def execute_decoder(repo, wav, config):
     from safe_runtime import run_command, decoded_output, command_argv
     engine = config['engine']
-    if engine == 'external-cw':
+    if engine in ('external-cw', 'external-speech', 'deepcw', 'multimon-cw',
+                  'morseangel', 'parakeet', 'qwen3-asr'):
         if not config.get('command'):
-            return {'status': 'blocked', 'error': 'external CW command not configured'}
+            return {'status': 'blocked', 'error': engine + ' command not configured'}
         argv = command_argv(config['command'], wav)
     else:
-        script = repo / 'scripts' / ('corpus_decode.py' if engine == 'speech' else 'cw_decode.py')
+        script = repo / 'scripts' / ('corpus_decode.py' if ENGINE_MODALITY[engine] == 'speech' else 'cw_decode.py')
         if not script.is_file():
             return {'status': 'blocked', 'error': 'decoder entry point missing: ' + str(script)}
         argv = [sys.executable, str(script), str(wav)]
-        if engine == 'speech':
+        if ENGINE_MODALITY[engine] == 'speech':
             argv += ['--model', config['model'], '--device', config['device'],
                      '--compute-type', config['compute_type']]
     started = time.monotonic()
     output = run_command(argv, config['timeout'])
     elapsed = time.monotonic() - started
-    if engine == 'speech':
+    if ENGINE_MODALITY[engine] == 'speech':
         try:
             value = json.loads(output['stdout'])
             if not isinstance(value, dict):
@@ -363,10 +397,12 @@ def execute_decoder(repo, wav, config):
             # A well-formed blocked result uses a nonzero exit code by design.
             if value.get('status') != 'blocked':
                 value = {'status': 'error', 'error': output['error']}
-        if value.get('status') == 'measured' and not isinstance(value.get('text'), str):
+        if value.get('status') in SUCCESS_STATUSES and not isinstance(value.get('text'), str):
             value = {'status': 'error', 'error': 'speech decoder text must be a string'}
-        if value.get('status') not in ('measured', 'blocked', 'error'):
+        if value.get('status') not in SUCCESS_STATUSES + ('blocked', 'error'):
             value = {'status': 'error', 'error': 'invalid speech decoder status'}
+        if value.get('status') == 'measured':
+            value['status'] = 'completed' if value.get('text', '').strip() else 'no_decode'
     else:
         # Some adapters express failure with a status field rather than error/decoded.
         try:
@@ -376,8 +412,12 @@ def execute_decoder(repo, wav, config):
         if isinstance(structured, dict) and structured.get('status') in (
                 'error', 'failed', 'failure', 'blocked', 'not_completed'):
             output['error'] = output['error'] or 'external decoder reported ' + structured['status']
-        value = decoded_output(output['stdout'], output['error'])
-        value['status'] = 'error' if value.get('error') else 'measured'
+        if isinstance(structured, dict) and structured.get('status') in SUCCESS_STATUSES:
+            value = structured
+        else:
+            value = decoded_output(output['stdout'], output['error'])
+            value['status'] = ('error' if value.get('error') else
+                               ('completed' if value.get('text') else 'no_decode'))
         value['confidence_note'] = 'heuristic/unvalidated; never an expiration criterion'
     value['wall_seconds'] = elapsed
     value['stderr'] = output['stderr']
@@ -424,15 +464,20 @@ def evaluate(root, repo, config, split='test', origin=None, runner=None):
                 if file_hash(wav) != asset['id']:
                     raise ValueError('audio checksum mismatch')
                 result = runner(repo, wav, config)
-                if not isinstance(result, dict) or result.get('status') not in ('measured', 'error', 'blocked'):
+                if not isinstance(result, dict) or result.get('status') not in SUCCESS_STATUSES + ('error', 'blocked'):
                     raise ValueError('decoder returned an invalid result')
-                if result['status'] == 'measured' and not isinstance(result.get('text'), str):
+                if result['status'] in SUCCESS_STATUSES and not isinstance(result.get('text'), str):
                     raise ValueError('measured result needs text, including empty text for no decode')
                 if file_hash(wav) != asset['id']:
                     raise ValueError('decoder changed the archived recording')
                 reference = json.loads(ref['reference']) if ref else {}
-                result['metrics'] = score(reference, result['text'], config['engine']) if (
-                    result['status'] == 'measured' and ref) else None
+                if ENGINE_MODALITY[config['engine']] == 'speech' and result['status'] in SUCCESS_STATUSES:
+                    from callsign_parser import parse_callsigns
+                    result['callsign_candidates'] = parse_callsigns(
+                        result['text'], result.get('words') or result.get('segments'))
+                result['metrics'] = score(reference, result['text'], config['engine'],
+                                          result.get('callsign_candidates')) if (
+                    result['status'] in SUCCESS_STATUSES and ref) else None
                 result['reference_provenance'] = reference.get('provenance')
                 duration = json.loads(asset['quality'])['duration_seconds']
                 result['cold_wall_real_time_factor'] = result.get('wall_seconds', 0) / duration
@@ -467,10 +512,76 @@ def report(root, run):
             'summary': summarize(results), 'results': results}
 
 
+def rescore_callsigns(root, repo, parent_run):
+    """Create an immutable parser-only child run from frozen raw ASR output.
+
+    Expected identities are read only after parsing and are passed to ``score``,
+    never to ``parse_callsigns``.  The parent result and its exact review ID stay
+    frozen, so changing a later review cannot silently change historical scores.
+    """
+    root, repo = Path(root).resolve(), Path(repo).resolve()
+    from callsign_parser import parse_callsigns
+    run = uuid.uuid4().hex
+    with closing(open_db(root)) as db:
+        parent = db.execute('SELECT * FROM runs WHERE id=?', (parent_run,)).fetchone()
+        if not parent:
+            raise ValueError('parent run not found')
+        parent_provenance = json.loads(parent['config'])
+        parent_config = parent_provenance.get('configuration', {})
+        engine = parent_config.get('engine')
+        if engine not in ENGINE_MODALITY or ENGINE_MODALITY[engine] != 'speech':
+            raise ValueError('callsign parser rescoring requires a speech run')
+        rows = db.execute('SELECT * FROM results WHERE run=? ORDER BY asset',
+                          (parent_run,)).fetchall()
+        if not rows:
+            raise ValueError('parent run has no results')
+        config = provenance(repo, {
+            'operation': 'callsign-parser-rescore', 'engine': engine,
+            'parent_run': parent_run, 'parent_created': parent['created'],
+            'parent_configuration': parent_config,
+            'reference_isolation': 'parse raw ASR before loading frozen review',
+        })
+        outcomes = []
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('INSERT INTO runs VALUES(?,?,?)', (run, utc_now(), encode(config)))
+            for row in rows:
+                result = json.loads(row['result'])
+                result.pop('callsign_candidates', None)
+                result.pop('metrics', None)
+                result['parser_rescore_parent'] = parent_run
+                if result.get('status') in SUCCESS_STATUSES:
+                    text = result.get('text')
+                    if not isinstance(text, str):
+                        raise ValueError('successful parent speech result has no text')
+                    # No review content is in scope while the parser runs.
+                    result['callsign_candidates'] = parse_callsigns(
+                        text, result.get('words') or result.get('segments'))
+                review = None
+                if row['review']:
+                    review = db.execute('SELECT * FROM reviews WHERE id=?',
+                                        (row['review'],)).fetchone()
+                    if not review:
+                        raise ValueError('frozen parent review is missing')
+                reference = json.loads(review['reference']) if review else {}
+                result['metrics'] = score(
+                    reference, result.get('text', ''), engine,
+                    result.get('callsign_candidates')) if (
+                        result.get('status') in SUCCESS_STATUSES and review) else None
+                result['reference_provenance'] = reference.get('provenance')
+                encode(result)
+                db.execute('INSERT INTO results VALUES(?,?,?,?)',
+                           (run, row['asset'], row['review'], encode(result)))
+                outcomes.append(result)
+    return {'run': run, 'parent_run': parent_run, 'summary': summarize(outcomes)}
+
+
 def compare(root, baseline, candidate):
     a, b = report(root, baseline), report(root, candidate)
-    if a['provenance']['configuration']['engine'] != b['provenance']['configuration']['engine']:
-        raise ValueError('compare runs of the same engine type')
+    old_engine = a['provenance']['configuration']['engine']
+    new_engine = b['provenance']['configuration']['engine']
+    if ENGINE_MODALITY[old_engine] != ENGINE_MODALITY[new_engine]:
+        raise ValueError('compare runs of the same modality')
     old = {r['asset']: r for r in a['results']}
     pairs, excluded = [], []
     for result in b['results']:
@@ -528,7 +639,7 @@ def retention_plan(root):
                 reasons.append('protected_reference_or_holdout')
             if not results:
                 reasons.append('not_evaluated')
-            if any(r['status'] != 'measured' or (r.get('metrics') is not None and not r['metrics']['exact']) for r in results):
+            if any(r['status'] not in SUCCESS_STATUSES or (r.get('metrics') is not None and not r['metrics']['exact']) for r in results):
                 reasons.append('failure_or_disagreement')
             decisions.append({'asset': asset['id'], 'action': 'keep', 'reasons': reasons})
     return {'mode': 'audit_only', 'deletion_enabled': False, 'metadata_action': 'keep', 'decisions': decisions}
@@ -552,8 +663,10 @@ def main(argv=None):
     e.add_argument('--split', choices=SPLITS, default='test'); e.add_argument('--origin', choices=ORIGINS)
     e.add_argument('--model', default='small.en'); e.add_argument('--device', default='cpu')
     e.add_argument('--compute-type', default='int8'); e.add_argument('--timeout', type=float, default=120)
-    e.add_argument('--command', default='', help='trusted external CW command with {wav}; no shell')
+    e.add_argument('--command', default='', help='trusted external decoder command with {wav}; no shell')
     r = sub.add_parser('report'); r.add_argument('run')
+    s = sub.add_parser('rescore-callsigns', help='versioned parser-only rescore of frozen raw speech output')
+    s.add_argument('run'); s.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
     d = sub.add_parser('compare'); d.add_argument('baseline'); d.add_argument('candidate')
     sub.add_parser('inventory', help='list recordings, capture sessions, reviews and run IDs')
     sub.add_parser('retention-plan', help='audit what must be kept; cannot delete anything')
@@ -598,6 +711,8 @@ def main(argv=None):
             result = evaluate(args.root, args.repo, config, args.split, args.origin)
         elif args.operation == 'report':
             result = report(args.root, args.run)
+        elif args.operation == 'rescore-callsigns':
+            result = rescore_callsigns(args.root, args.repo, args.run)
         elif args.operation == 'compare':
             result = compare(args.root, args.baseline, args.candidate)
         elif args.operation == 'inventory':
@@ -605,7 +720,7 @@ def main(argv=None):
         else:
             result = retention_plan(args.root)
         print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
-        if args.operation == 'run' and any(k != 'measured' and v for k, v in result['summary']['statuses'].items()):
+        if args.operation == 'run' and any(k not in SUCCESS_STATUSES and v for k, v in result['summary']['statuses'].items()):
             return 2
         return 0
     except (ValueError, OSError, sqlite3.Error) as exc:

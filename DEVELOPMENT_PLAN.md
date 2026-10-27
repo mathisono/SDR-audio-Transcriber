@@ -27,15 +27,19 @@ corpus work is based on its head `87c87e7a141580d3e067ba1b9da947d86c35f3bb`, not
 older `main` implementation. Merge/rebase dependencies deliberately; do not run
 old and new consumers against the same live runtime directories.
 
-This increment adds `scripts/recording_corpus.py`, `scripts/corpus_decode.py` and
-regression tests. It copies finalized recordings into a private local corpus,
-records acquisition settings and PCM diagnostics, stores append-only reviewed
-references, runs actual decoder commands when available, and compares predictions
-against fixed references. See [the collection/testing runbook](docs/recording-corpus.md).
+The corpus increment adds `scripts/recording_corpus.py`, stable backend identities,
+versioned callsign-parser rescoring and supervised local decoder adapters. It copies
+finalized recordings into a private local corpus, records acquisition settings and
+PCM diagnostics, stores append-only reviewed references, runs actual decoder
+commands when available, and compares predictions against fixed references. See
+the [collection/testing runbook](docs/recording-corpus.md) and the
+[local-decoder comparison](docs/local-decoder-comparison.md).
 
-It does **not** start a receiver, change live settings, train a model, install a
-neural CW backend, demonstrate live-RF accuracy, export SigMF, or delete data.
-The retention command is audit-only and always keeps recordings and metadata.
+It does **not** start a receiver, change live settings, train a model, demonstrate
+production-grade RF accuracy, export SigMF, or delete data. The retention command
+is audit-only and always keeps recordings and metadata. Isolated DeepCW,
+multimon-ng, Parakeet and Qwen runtimes used for the pilot remain private and are
+not installed by this repository.
 
 ## Architectural invariants
 
@@ -97,6 +101,33 @@ where available, signal qualities and speakers; a convenient small sample is not
 an acceptance dataset. Choose numerical acceptance thresholds after the pilot,
 before evaluating the final held-out set.
 
+### M1.5 — Local decoder candidate pilot (experimental)
+
+The 2026-09-28 fixed-audio pilot ran real DeepCW, multimon-ng, internal DSP,
+Parakeet TDT 0.6B v3 and Qwen3-ASR 0.6B inference without changing capture or
+production. DeepCW recovered 3/3 reviewed IDs in full one-minute sources;
+multimon-ng recovered 2/3; internal DSP recovered 1/3 and emitted three extra
+callsign-shaped tokens. Parakeet recovered 1/4 source-linked reviewed spoken
+callsigns after rule-based interpretation; the Whisper control recovered 0/4.
+Qwen completed too little coverage and was slower than real time on the CPU host.
+
+These candidate-enriched counts do not pass M1 or M5. DeepCW and Parakeet earn a
+larger session-balanced trial; automatic station promotion and decoder replacement
+remain disabled. Freeze more independent reviews and real negative controls before
+choosing thresholds or opening the held-out session.
+
+The 2026-10-24 same-clip follow-up ran Parakeet and faster-whisper `small.en` on
+all 35 frozen blind-review clips (936.2 seconds) with no decoder errors. Both
+matched the independent audio-model branch's speech-presence decisions on all 33
+usable automated reviews. Parakeet had lower transcript disagreement with that
+branch (0.510 versus 0.637 word edits per automated-review word), but took 551
+seconds versus 189 seconds on the bounded CPU run. Automated agreement is not
+human truth and WER remains null. Combined with the earlier human-reviewed
+callsign pilot (Parakeet 1/4, Whisper 0/4), Parakeet is selected as the **primary
+experimental speech implementation** and Whisper remains the fast baseline and
+fallback. This decision advances implementation only; M1 review coverage and
+production-accuracy gates remain open.
+
 ### M2 — Single-chain I/Q replay and acquisition experiments
 
 Add optional SigMF-compatible I/Q retention and replay, starting with one known FM
@@ -140,6 +171,22 @@ zooming and delayed processing; raw text survives UI/network failure.
 First run several known channels concurrently using one I/Q stream and a bounded
 shared pool of loaded transcription models. Do not load a full Whisper model per
 frequency. Benchmark aggregate channel traffic on the target hardware.
+
+Put speech backends behind a normalized provider contract so the same queue can
+use a downloaded local model, a persistent LAN service, or an explicitly
+configured remote audio-transcription provider. Preserve provider/model identity,
+source checksum, raw output, timestamps, queue/network/inference timing, failures,
+fallback history, and remote-retention policy on every result. LM Studio is a
+valid route only when the selected model and endpoint are verified to accept
+audio; text cleanup is not ASR.
+
+Add a hardware optimizer that benchmarks cold/warm RTF, p50/p95 latency, queue
+recovery, memory/VRAM, thermals, network reliability, and remote cost. It may tune
+speed and resource settings automatically within explicit constraints, but it
+must use independently reviewed references for accuracy floors. Cache profiles by
+hardware, engine/model revision, preprocessing, quantization, threads, and chunk
+policy. Keep a local-only privacy mode and report a blocker when no profile meets
+all required constraints.
 
 Then add detection, modulation checking, channel tracking and a receiver lifecycle:
 detected -> checking -> receiving -> holding -> idle. Detection proposes a signal;
@@ -219,6 +266,7 @@ post hoc or filter out failures to manufacture progress.
 ## References
 
 - [Collection and decoder testing runbook](docs/recording-corpus.md)
+- [Local speech and CW decoder comparison](docs/local-decoder-comparison.md)
 - [Speech-first reliability](docs/speech-first-reliability.md)
 - [SigMF specification](https://sigmf.org/): capture/annotation and extension rules.
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper): actual inference API.

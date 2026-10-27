@@ -90,6 +90,25 @@ fixtures must use `provenance: "synthetic"` and a synthetic capture origin; do n
 present them as human-reviewed RF. Optional `required_tokens` checks important
 speech strings without inventing phonetic or number normalization.
 
+When only an identity was independently reviewed, keep unreviewed verbatim text
+null and use modality-specific identities instead of inventing a transcript:
+
+```json
+{
+  "provenance": "human",
+  "speech": null,
+  "cw": null,
+  "speech_callsigns": ["A1BCD"],
+  "cw_callsigns": null,
+  "protected": true
+}
+```
+
+The value above is schema illustration only. Callsign identities are scorer input,
+not decoder prompts, parser dictionaries or automatic corrections. Legacy CW-only
+`callsigns` remains readable; new reviews should use `speech_callsigns` or
+`cw_callsigns` so operator speech cannot rename a repeater.
+
 ```bash
 python3 scripts/recording_corpus.py --root runtime/corpus annotate ASSET_ID \
   --reviewer 'operator' --reference runtime/reference.json
@@ -121,8 +140,15 @@ Run internal DSP CW independently:
 
 ```bash
 python3 scripts/recording_corpus.py --root runtime/corpus run \
-  --engine cw --split validation --origin rf --timeout 60
+  --engine cw-internal --split validation --origin rf --timeout 60
 ```
+
+Stable local backend IDs are `whisper`, `parakeet`, `qwen3-asr`, `cw-internal`,
+`deepcw`, `multimon-cw` and `morseangel`. Historical `speech`, `cw` and
+`external-cw` runs remain readable. All non-built-in backends require a trusted,
+bounded `--command`; an adapter without its real runtime/model is `blocked`.
+Reproducible commands and licenses are in
+[the local-decoder runbook](local-decoder-comparison.md).
 
 For an actual installed external CW engine, supply its verified command with a
 `{wav}` placeholder through `--engine external-cw --command '...'`. Commands run
@@ -153,7 +179,7 @@ version, or change a model setting while keeping original audio/references fixed
 The target checkout must contain the corresponding decoder entry point. The active
 interpreter supplies dependencies; changing `--repo` does not create another venv.
 
-Compare uses only matching recording and reference IDs of the same engine type.
+Compare uses only matching recording and reference IDs of the same modality.
 It lists unmatched, unreviewed or failed pairs as excluded. Lower paired error
 counts are improvement on those recordings, not proof that acquisition improved.
 Changing receivers/settings while also changing the model is not a controlled A/B.
@@ -163,6 +189,17 @@ controls. Errors/blocked outputs are not scored as correct silence. WER can exce
 1. Unreviewed targets have no score. CW `?` remains an error symbol. Callsign
 extraction is a heuristic for comparison, not an authoritative worldwide callsign
 validator. RF and synthetic subsets must be reported separately.
+
+Raw speech is parsed before expected identities are loaded. The parser preserves
+compact or contiguous phonetic/spelled candidates, raw supporting spans,
+timestamps when available, alternatives and incomplete structures. It performs no
+fuzzy edit, station lookup or missing-character repair. Parser revisions create a
+new immutable child run over frozen ASR and review IDs:
+
+```bash
+python3 scripts/recording_corpus.py --root runtime/corpus \
+  rescore-callsigns PARENT_SPEECH_RUN --repo .
+```
 
 For holdout acceptance, predeclare error limits and minimum sample/session coverage
 before looking at the results. The tool intentionally has no universal accuracy

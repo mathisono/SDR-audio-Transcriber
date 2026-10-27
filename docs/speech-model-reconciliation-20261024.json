@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-10-24T04:31:42Z",
+  "decision": {
+    "primary_experimental_speech_backend": "parakeet-tdt-0.6b-v3-q8_0",
+    "fallback_backend": "faster-whisper-small.en-cpu-int8",
+    "production_accuracy_claim": false,
+    "human_wer_available": false,
+    "human_field_callsign_accuracy_available": false
+  },
+  "corpus": {
+    "clips": 35,
+    "duration_seconds": 936.2,
+    "database_sha256": "ec2df3604802aad68931596a6cf23c4ee3acba2973c70518f55115bd2419d988"
+  },
+  "blind_audio_model_evidence": {
+    "results_sha256": "ddc1762d098e6fe53a4c1c24cd1a1a831a718b4fcc0280011fde0cf9a654b53a",
+    "responses_total": 35,
+    "schema_usable": 33,
+    "failed_or_non_schema": 2,
+    "role": "automated agreement only; not human ground truth"
+  },
+  "runs": [
+    {
+      "backend": "parakeet",
+      "run_id": "8ee6fab4310343debc9a44127107f666",
+      "model": "nvidia/parakeet-tdt-0.6b-v3-q8_0",
+      "model_revision": "541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+      "model_sha256": "e3880d0aaaaf2c308ea2c35016b2b895c423eb3fda924c1b463d1c19b7f4d32e",
+      "attempted": 35,
+      "completed_text": 23,
+      "no_decode": 12,
+      "errors": 0,
+      "wall_seconds": 550.99,
+      "outer_real_time_factor": 0.588,
+      "peak_rss_kib": 1167224,
+      "speech_presence_agreement": {
+        "usable": 33,
+        "both_speech": 22,
+        "both_no_speech": 11,
+        "disagreements": 0
+      },
+      "automated_transcript_disagreement": {
+        "clips_with_text_on_both_branches": 22,
+        "micro_word_edits_per_audio_model_word": 0.5095975232,
+        "median_clip_rate": 0.4480536913,
+        "human_wer": null
+      },
+      "automated_callsign_candidate_comparison": {
+        "local_candidate_clips": 13,
+        "both_candidate": 5,
+        "local_only": 8,
+        "model_only": 2,
+        "neither": 18,
+        "exact_string_agreements": ["KJ6DZB"]
+      }
+    },
+    {
+      "backend": "whisper",
+      "run_id": "051e8eda54fd442b9f08a3f5e6b19e07",
+      "model": "small.en",
+      "device": "cpu",
+      "compute_type": "int8",
+      "attempted": 35,
+      "completed_text": 23,
+      "no_decode": 12,
+      "errors": 0,
+      "wall_seconds": 189.36,
+      "outer_real_time_factor": 0.202,
+      "peak_rss_kib": 920244,
+      "speech_presence_agreement": {
+        "usable": 33,
+        "both_speech": 22,
+        "both_no_speech": 11,
+        "disagreements": 0
+      },
+      "automated_transcript_disagreement": {
+        "clips_with_text_on_both_branches": 22,
+        "micro_word_edits_per_audio_model_word": 0.6365325077,
+        "median_clip_rate": 0.6035714286,
+        "human_wer": null
+      },
+      "automated_callsign_candidate_comparison": {
+        "local_candidate_clips": 6,
+        "both_candidate": 4,
+        "local_only": 2,
+        "model_only": 3,
+        "neither": 24,
+        "exact_string_agreements": ["BLAST"]
+      }
+    }
+  ],
+  "human_reviewed_pilot": {
+    "scope": "fixed six-source candidate-enriched pilot",
+    "source_linked_spoken_callsigns": 4,
+    "parakeet_exact_recoveries": 1,
+    "whisper_exact_recoveries": 0,
+    "population_generalization_allowed": false
+  },
+  "worker_smoke": {
+    "clip": "review-014.wav",
+    "audio_sha256": "7e8353f538cc726a2561b7fc852f10c5d2d86b7d890079dd61f8092553ec9104",
+    "status": "complete",
+    "backend": "parakeet",
+    "timestamped_segments": 32,
+    "failed_archive_entries": 0,
+    "accuracy_verified": false
+  },
+  "next_gate": "session-balanced independent human transcripts and callsign/absence/unclear labels"
+}

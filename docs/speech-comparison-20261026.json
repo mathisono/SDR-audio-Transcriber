@@ -1,0 +1,402 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-26",
+  "status": "completed_experimental",
+  "configuration": {
+    "clips": 41,
+    "audio_seconds": 1296.2,
+    "host": "io3 i7-7700",
+    "initial_cpu_affinity": [
+      2,
+      3
+    ],
+    "initial_threads": 2,
+    "profile_caveat": "per-result CPU/thread profiles may differ after thermal guard stops; do not rank mixed-profile speed as a model-only effect"
+  },
+  "human_wer": null,
+  "field_callsign_accuracy": null,
+  "manifest_sha256": "f8d693cbb0e95a91d46e0d008245334749f7e004385dfb68cb72ad9a6516f64b",
+  "models": [
+    {
+      "backend": "parakeet-v2",
+      "attempted": 41,
+      "complete": true,
+      "statuses": {
+        "completed": 27,
+        "no_decode": 14
+      },
+      "subsets": {
+        "review35": {
+          "attempted": 35,
+          "successful": 35,
+          "statuses": {
+            "completed": 23,
+            "no_decode": 12
+          },
+          "successful_audio_seconds": 936.2,
+          "inference_wall_seconds": 93.01593911647797,
+          "weighted_rtf": 0.09935477367707538,
+          "approx_unpaused_rtf": 0.09935477367707538,
+          "thermal_pause_seconds_within_successful_clips": 0,
+          "median_clip_seconds": 1.033122703898698,
+          "p95_clip_rtf": 0.10533157196672012,
+          "slower_than_audio_clips": 0,
+          "execution_profiles": {
+            "2-cpu-profile": {
+              "clips": 35,
+              "duration_seconds": 936.2,
+              "wall_seconds": 93.01593911647797,
+              "approx_unpaused_seconds": 93.01593911647797,
+              "wall_rtf": 0.09935477367707538,
+              "approx_unpaused_rtf": 0.09935477367707538
+            }
+          }
+        },
+        "pilot6": {
+          "attempted": 6,
+          "successful": 6,
+          "statuses": {
+            "completed": 4,
+            "no_decode": 2
+          },
+          "successful_audio_seconds": 360,
+          "inference_wall_seconds": 36.780246591661125,
+          "weighted_rtf": 0.10216735164350313,
+          "approx_unpaused_rtf": 0.10216735164350313,
+          "thermal_pause_seconds_within_successful_clips": 0,
+          "median_clip_seconds": 6.123987852828577,
+          "p95_clip_rtf": 0.10375966143328696,
+          "slower_than_audio_clips": 0,
+          "execution_profiles": {
+            "2-cpu-profile": {
+              "clips": 6,
+              "duration_seconds": 360,
+              "wall_seconds": 36.780246591661125,
+              "approx_unpaused_seconds": 36.780246591661125,
+              "wall_rtf": 0.10216735164350313,
+              "approx_unpaused_rtf": 0.10216735164350313
+            }
+          }
+        }
+      },
+      "sampled_peak_rss_kib": 2016988,
+      "all_attempts_outer_wall_seconds": 143.02437138557434,
+      "thermal_pause_seconds": 0,
+      "thermal_guard_stops": [
+        "temperature unavailable or >=85 C"
+      ],
+      "legacy_canonical_pilot": {
+        "correct": 0,
+        "total": 4
+      },
+      "existing_parser_pilot": {
+        "correct": 0,
+        "total": 4
+      },
+      "automated_review_not_human_truth": {
+        "presence_table_local_then_model": {
+          "(True, True)": 22,
+          "(False, False)": 11
+        },
+        "paired_nonempty_transcripts": 22,
+        "word_edit_disagreement": 0.42792501616031026,
+        "reference_words": 1547,
+        "human_wer": null
+      }
+    },
+    {
+      "backend": "parakeet-v3",
+      "attempted": 41,
+      "complete": true,
+      "statuses": {
+        "completed": 26,
+        "no_decode": 15
+      },
+      "subsets": {
+        "review35": {
+          "attempted": 35,
+          "successful": 35,
+          "statuses": {
+            "completed": 23,
+            "no_decode": 12
+          },
+          "successful_audio_seconds": 936.2,
+          "inference_wall_seconds": 1000.4668013076298,
+          "weighted_rtf": 1.0686464444644626,
+          "approx_unpaused_rtf": 0.5990635255166432,
+          "thermal_pause_seconds_within_successful_clips": 439.62352871894836,
+          "median_clip_seconds": 14.52980700833723,
+          "p95_clip_rtf": 1.467855157260783,
+          "slower_than_audio_clips": 21,
+          "execution_profiles": {
+            "2-cpu-profile": {
+              "clips": 14,
+              "duration_seconds": 359.88,
+              "wall_seconds": 205.51369380624965,
+              "approx_unpaused_seconds": 115.69518994959071,
+              "wall_rtf": 0.5710617255925576,
+              "approx_unpaused_rtf": 0.32148268853392997
+            },
+            "1-cpu-profile": {
+              "clips": 21,
+              "duration_seconds": 576.3199999999999,
+              "wall_seconds": 794.9531075013801,
+              "approx_unpaused_seconds": 445.1480826390907,
+              "wall_rtf": 1.3793606112947325,
+              "approx_unpaused_rtf": 0.7723974226802658
+            }
+          }
+        },
+        "pilot6": {
+          "attempted": 6,
+          "successful": 6,
+          "statuses": {
+            "completed": 3,
+            "no_decode": 3
+          },
+          "successful_audio_seconds": 360,
+          "inference_wall_seconds": 515.7694584885612,
+          "weighted_rtf": 1.4326929402460034,
+          "approx_unpaused_rtf": 0.800263005373482,
+          "thermal_pause_seconds_within_successful_clips": 227.67477655410767,
+          "median_clip_seconds": 85.6585767979268,
+          "p95_clip_rtf": 1.4674579083997135,
+          "slower_than_audio_clips": 6,
+          "execution_profiles": {
+            "1-cpu-profile": {
+              "clips": 6,
+              "duration_seconds": 360,
+              "wall_seconds": 515.7694584885612,
+              "approx_unpaused_seconds": 288.09468193445355,
+              "wall_rtf": 1.4326929402460034,
+              "approx_unpaused_rtf": 0.800263005373482
+            }
+          }
+        }
+      },
+      "sampled_peak_rss_kib": 1238420,
+      "all_attempts_outer_wall_seconds": 1545.284244775772,
+      "thermal_pause_seconds": 675.9335880279541,
+      "thermal_guard_stops": [
+        "temperature unavailable or >=85 C: [85.0, 27.8, 29.8]",
+        "temperature unavailable or >=85 C"
+      ],
+      "legacy_canonical_pilot": {
+        "correct": 0,
+        "total": 4
+      },
+      "existing_parser_pilot": {
+        "correct": 1,
+        "total": 4
+      },
+      "automated_review_not_human_truth": {
+        "presence_table_local_then_model": {
+          "(True, True)": 22,
+          "(False, False)": 11
+        },
+        "paired_nonempty_transcripts": 22,
+        "word_edit_disagreement": 0.5061409179056238,
+        "reference_words": 1547,
+        "human_wer": null
+      }
+    },
+    {
+      "backend": "vosk",
+      "attempted": 41,
+      "complete": true,
+      "statuses": {
+        "completed": 28,
+        "no_decode": 13
+      },
+      "subsets": {
+        "review35": {
+          "attempted": 35,
+          "successful": 35,
+          "statuses": {
+            "completed": 23,
+            "no_decode": 12
+          },
+          "successful_audio_seconds": 936.2,
+          "inference_wall_seconds": 101.8175406572409,
+          "weighted_rtf": 0.10875618527797574,
+          "approx_unpaused_rtf": 0.10875618527797574,
+          "thermal_pause_seconds_within_successful_clips": 0,
+          "median_clip_seconds": 1.4049949469044805,
+          "p95_clip_rtf": 0.2196596681068723,
+          "slower_than_audio_clips": 0,
+          "execution_profiles": {
+            "2-cpu-profile": {
+              "clips": 35,
+              "duration_seconds": 936.2,
+              "wall_seconds": 101.8175406572409,
+              "approx_unpaused_seconds": 101.8175406572409,
+              "wall_rtf": 0.10875618527797574,
+              "approx_unpaused_rtf": 0.10875618527797574
+            }
+          }
+        },
+        "pilot6": {
+          "attempted": 6,
+          "successful": 6,
+          "statuses": {
+            "completed": 5,
+            "no_decode": 1
+          },
+          "successful_audio_seconds": 360,
+          "inference_wall_seconds": 17.307624687440693,
+          "weighted_rtf": 0.048076735242890814,
+          "approx_unpaused_rtf": 0.048076735242890814,
+          "thermal_pause_seconds_within_successful_clips": 0,
+          "median_clip_seconds": 2.594421380897984,
+          "p95_clip_rtf": 0.07573536954975377,
+          "slower_than_audio_clips": 0,
+          "execution_profiles": {
+            "2-cpu-profile": {
+              "clips": 6,
+              "duration_seconds": 360,
+              "wall_seconds": 17.307624687440693,
+              "approx_unpaused_seconds": 17.307624687440693,
+              "wall_rtf": 0.048076735242890814,
+              "approx_unpaused_rtf": 0.048076735242890814
+            }
+          }
+        }
+      },
+      "sampled_peak_rss_kib": 334332,
+      "all_attempts_outer_wall_seconds": 120.61238598823547,
+      "thermal_pause_seconds": 0,
+      "thermal_guard_stops": [],
+      "legacy_canonical_pilot": {
+        "correct": 0,
+        "total": 4
+      },
+      "existing_parser_pilot": {
+        "correct": 0,
+        "total": 4
+      },
+      "automated_review_not_human_truth": {
+        "presence_table_local_then_model": {
+          "(True, True)": 22,
+          "(False, False)": 11
+        },
+        "paired_nonempty_transcripts": 22,
+        "word_edit_disagreement": 0.9036845507433743,
+        "reference_words": 1547,
+        "human_wer": null
+      }
+    },
+    {
+      "backend": "whisper-large-v3",
+      "attempted": 41,
+      "complete": true,
+      "statuses": {
+        "completed": 26,
+        "no_decode": 15
+      },
+      "subsets": {
+        "review35": {
+          "attempted": 35,
+          "successful": 35,
+          "statuses": {
+            "completed": 23,
+            "no_decode": 12
+          },
+          "successful_audio_seconds": 936.2,
+          "inference_wall_seconds": 1821.2700496334583,
+          "weighted_rtf": 1.9453856543830998,
+          "approx_unpaused_rtf": 1.1517363307307995,
+          "thermal_pause_seconds_within_successful_clips": 743.0144968032837,
+          "median_clip_seconds": 49.011866031214595,
+          "p95_clip_rtf": 9.397006663670199,
+          "slower_than_audio_clips": 21,
+          "execution_profiles": {
+            "1-cpu-profile": {
+              "clips": 35,
+              "duration_seconds": 936.2,
+              "wall_seconds": 1821.2700496334583,
+              "approx_unpaused_seconds": 1078.2555528301746,
+              "wall_rtf": 1.9453856543830998,
+              "approx_unpaused_rtf": 1.1517363307307995
+            }
+          }
+        },
+        "pilot6": {
+          "attempted": 6,
+          "successful": 6,
+          "statuses": {
+            "completed": 3,
+            "no_decode": 3
+          },
+          "successful_audio_seconds": 360,
+          "inference_wall_seconds": 156.1308625903912,
+          "weighted_rtf": 0.4336968405288644,
+          "approx_unpaused_rtf": 0.24650829334148308,
+          "thermal_pause_seconds_within_successful_clips": 67.38787698745728,
+          "median_clip_seconds": 23.268459665123373,
+          "p95_clip_rtf": 1.0188244613353163,
+          "slower_than_audio_clips": 1,
+          "execution_profiles": {
+            "1-cpu-profile": {
+              "clips": 6,
+              "duration_seconds": 360,
+              "wall_seconds": 156.1308625903912,
+              "approx_unpaused_seconds": 88.74298560293391,
+              "wall_rtf": 0.4336968405288644,
+              "approx_unpaused_rtf": 0.24650829334148308
+            }
+          }
+        }
+      },
+      "sampled_peak_rss_kib": 6000436,
+      "all_attempts_outer_wall_seconds": 1991.1227116584778,
+      "thermal_pause_seconds": 811.7374439239502,
+      "thermal_guard_stops": [],
+      "legacy_canonical_pilot": {
+        "correct": 0,
+        "total": 4
+      },
+      "existing_parser_pilot": {
+        "correct": 0,
+        "total": 4
+      },
+      "automated_review_not_human_truth": {
+        "presence_table_local_then_model": {
+          "(True, True)": 22,
+          "(False, False)": 11
+        },
+        "paired_nonempty_transcripts": 22,
+        "word_edit_disagreement": 0.5985778926955397,
+        "reference_words": 1547,
+        "human_wer": null
+      }
+    }
+  ],
+  "audit": {
+    "source_hashes_verified": 41,
+    "derived_hashes_verified": 41,
+    "model_and_runtime_files_verified": 28,
+    "model_clip_evaluations": 164,
+    "final_result_errors": 0,
+    "prior_thermal_aborts": 3
+  },
+  "decision": {
+    "live_backend_changed": false,
+    "current_default": "Parakeet TDT 0.6B v3 Q8 (experimental)",
+    "next_speed_candidate": "Parakeet TDT 0.6B v2 ONNX INT8",
+    "large_v3_cpu_recommended_for_live_gui": false,
+    "production_accuracy_verified": false,
+    "next_gate": "Independent human review of paired disagreements and matched-runtime v3 ONNX comparison before switching the live default."
+  },
+  "limitations": [
+    "Previously used validation clips, not held-out or session-balanced.",
+    "Only four historical reviewed spoken-callsign occurrences; references were not fully blinded.",
+    "Legacy scorer is canonical-token substring matching, not precision.",
+    "Existing-parser whole-candidate matching is a post-decode secondary analysis using unchanged fixed aliases (including Gulf=G).",
+    "v2/v3 runtime, quantization, and actual CPU profiles differ; do not infer a model-version-only speed effect.",
+    "RTF includes recorded within-clip thermal pauses; approximate unpaused RTF subtracts those intervals but is not a no-governor counterfactual.",
+    "Whole-run wall sums attempts but excludes operator time between attempts.",
+    "Whisper VAD skipped ASR on 15 of 41 inputs; all 41 pipeline evaluations completed.",
+    "CPU affinity is enforced; NeMo --threads configures HTTP workers, not a verified ASR thread count.",
+    "No new RF capture, receiver retune, hosted audio upload, or live backend replacement."
+  ]
+}
