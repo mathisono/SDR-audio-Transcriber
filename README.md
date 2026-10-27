@@ -23,20 +23,32 @@ rtl_fm -> clip_writer -> queue/*.wav -> transcribe_worker
 ## Decoder decisions and evidence
 
 The current implementation choices are **experimental**, not production-accuracy
-claims. On the identical 35-clip local comparison, Parakeet TDT 0.6B v3 Q8 ran at
+claims. In the 2026-10-24 identical 35-clip local comparison, Parakeet TDT 0.6B v3 Q8 ran at
 0.588 real-time factor and faster-whisper `small.en` at 0.202; both completed all
 clips without decoder errors. The small independently reviewed callsign pilot
 favored Parakeet 1/4 versus Whisper 0/4. Human WER and representative field
 callsign accuracy remain unmeasured.
 
 - [Speech model selection](docs/speech-model-selection.md)
+- [Fresh io3 speech comparison: v2/v3, large-v3 and Vosk](docs/speech-comparison-20261026.md)
+- [Fresh comparison machine-readable results](docs/speech-comparison-20261026.json)
 - [Machine-readable reconciliation](docs/speech-model-reconciliation-20261024.json)
 - [Real-time, local/remote provider, and hardware-optimizer notes](docs/provider-routing-and-optimization.md)
 - [Local decoder comparison and reproducible commands](docs/local-decoder-comparison.md)
 
-On the tested CPU host, Parakeet's measured 0.588 RTF and Whisper's 0.202
-RTF both support a single continuous channel in throughput terms. Offloading is
-optional for that case. A future normalized provider layer will support downloaded
+The 2026-10-26 io3 follow-up completed 41 inputs on each of four backends. V2 ONNX
+was the strongest speed candidate (0.099 review-set RTF); Vosk used least memory.
+Current v3 required thermal recovery/pacing; large-v3 was too slow on its guarded
+CPU profile (1.945 RTF). Only current v3 recovered one of four reviewed spoken
+callsigns through the existing phonetic parser; general accuracy remains unmeasured.
+Runtime/CPU profiles differ, so these are deployment-combination observations,
+not a pure model-version ranking. **Parakeet TDT 0.6B v3 Q8 remains the selected
+live speech backend**, confirmed running on MSE-88 on 2026-10-26. V2 remains an
+evaluation candidate, not an automatic replacement.
+
+Earlier sub-real-time compute timings do not guarantee continuous GUI throughput:
+thermal protection and buffering can change that result. A future normalized
+provider layer will support downloaded
 local models, persistent LAN services, and explicitly configured remote audio
 providers. LM Studio is eligible only when its active model/server actually
 supports audio transcription; a text cleanup model is not an ASR backend. The

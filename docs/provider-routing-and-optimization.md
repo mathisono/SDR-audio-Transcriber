@@ -13,17 +13,25 @@ Real-time factor (RTF) is decoder wall time divided by audio duration. An RTF be
 | Parakeet TDT 0.6B v3 Q8 | 0.588 | 1.70x real time | 35.3 s |
 | faster-whisper `small.en` | 0.202 | 4.95x real time | 12.1 s |
 
-Both currently have enough measured throughput for one continuous channel on the
-tested host. Offloading is not required for that case. These measurements include
+Those historical timings showed compute headroom, not validated continuous
+capacity. These measurements include
 cold per-clip evaluator overhead and are not a warmed multi-channel benchmark.
-The live Whisper worker keeps its model loaded and may do better; the current
-Parakeet integration invokes a bounded one-shot adapter per clip and would benefit
-from a persistent service.
+The standalone companion now uses a persistent local Parakeet service; the older
+one-shot evaluator/adapter remains a distinct path.
+
+The [2026-10-26 follow-up](speech-comparison-20261026.md) completed 41 files on each
+of v2 ONNX INT8, current v3 Q8, Vosk small and Whisper large-v3 INT8. V2's review-set
+RTF was 0.099 and Vosk's 0.109. Current v3 needed thermal stops and changed CPU
+profiles; large-v3's guarded single-CPU RTF was 1.945 with 5.72 GiB sampled peak RSS.
+These profiles differ, and neither short compute bursts nor subtracting thermal
+pauses proves sustained GUI capacity. Test-only thermal pacing is not a deployed
+hardware optimizer. No remote/GPU provider was benchmarked or implicitly selected.
 
 Throughput is not end-to-end latency. The current pipeline starts transcription
-after a squelch-gated clip closes, so visible latency includes the transmission
-duration plus queueing and inference. Partial streaming transcripts are a separate
-future capability.
+after a finalized file closes in the file-based path. The companion instead uses
+short pause-aware chunks. In either case, visible latency includes buffering plus
+queueing and inference. A true incremental streaming decoder is distinct from
+this chunked live display.
 
 For planning only, aggregate decoder utilization can be estimated as:
 
